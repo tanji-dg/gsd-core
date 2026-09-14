@@ -1,7 +1,7 @@
 @~/.claude/gsd-core/references/response-language-directive.md
 
 <purpose>
-Create structured `.planning/HANDOFF.json` and `.continue-here.md` handoff files to preserve complete work state across sessions. The JSON provides machine-readable state for `/gsd:resume-work`; the markdown provides human-readable context.
+Create structured `.planning/HANDOFF.json` and `.continue-here.md` handoff files to preserve complete work state across sessions. The JSON provides machine-readable state for `/gsd:resume-work`; the markdown provides human-readable context. Both filenames are keyed by session id (e.g. `HANDOFF.<session_id>.json`) so concurrent sessions paused in the same directory don't overwrite each other's handoff.
 </purpose>
 
 <required_reading>
@@ -16,6 +16,19 @@ Read all files referenced by the invoking prompt's execution_context before star
 Determine what kind of work is being paused and set the handoff destination accordingly:
 
 ```bash
+# Key the handoff filename by session id so concurrent sessions (e.g. multiple
+# Claude Code sessions paused in the same working directory) never overwrite
+# each other's handoff, and a resuming session can tell which one is its own.
+# Falls back to the unkeyed legacy filename if the env var isn't set (older client).
+session_id="${CLAUDE_CODE_SESSION_ID:-}"
+if [ -n "$session_id" ]; then
+  continue_here_name=".continue-here.${session_id}.md"
+  handoff_json_name="HANDOFF.${session_id}.json"
+else
+  continue_here_name=".continue-here.md"
+  handoff_json_name="HANDOFF.json"
+fi
+
 # Check for active phase
 phase=$(ls -t .planning/phases/*/*-PLAN.md 2>/dev/null | head -1 || true)
 phase=${phase:+$(basename "$(dirname "$phase")")}
@@ -32,12 +45,12 @@ sketch=${sketch:+$(basename "$(dirname "$sketch")")}
 deliberation=$(ls .planning/deliberations/*.md 2>/dev/null | head -1 || true)
 ```
 
-- **Phase work**: active phase directory → handoff to `.planning/phases/XX-name/.continue-here.md`
-- **Spike work**: active spike directory or spike-related files (no active phase) → handoff to `.planning/spikes/SPIKE-NNN/.continue-here.md` (create directory if needed)
-- **Sketch work**: active sketch directory (no active phase/spike) → handoff to `.planning/sketches/.continue-here.md`
-- **Deliberation work**: active deliberation file (no phase/spike/sketch) → handoff to `.planning/deliberations/.continue-here.md`
-- **Research work**: research notes exist but no phase/spike/sketch/deliberation → handoff to `.planning/.continue-here.md`
-- **Default**: no detectable context → handoff to `.planning/.continue-here.md`, note the ambiguity in `<current_state>`
+- **Phase work**: active phase directory → handoff to `.planning/phases/XX-name/${continue_here_name}`
+- **Spike work**: active spike directory or spike-related files (no active phase) → handoff to `.planning/spikes/SPIKE-NNN/${continue_here_name}` (create directory if needed)
+- **Sketch work**: active sketch directory (no active phase/spike) → handoff to `.planning/sketches/${continue_here_name}`
+- **Deliberation work**: active deliberation file (no phase/spike/sketch) → handoff to `.planning/deliberations/${continue_here_name}`
+- **Research work**: research notes exist but no phase/spike/sketch/deliberation → handoff to `.planning/${continue_here_name}`
+- **Default**: no detectable context → handoff to `.planning/${continue_here_name}`, note the ambiguity in `<current_state>`
 
 If phase is detected, proceed with phase handoff path. Otherwise use the first matching non-phase path above.
 </step>
@@ -46,15 +59,16 @@ If phase is detected, proceed with phase handoff path. Otherwise use the first m
 **Collect complete state for handoff:**
 
 1. **Current position**: Which phase, which plan, which task
-2. **Work completed**: What got done this session
-3. **Work remaining**: What's left in current plan/phase
-4. **Decisions made**: Key decisions and rationale
-5. **Blockers/issues**: Anything stuck
-6. **Human actions pending**: Things that need manual intervention (MCP setup, API keys, approvals, manual testing)
-7. **Background processes**: Any running servers/watchers that were part of the workflow
-8. **Files modified**: What's changed but not committed
-9. **Outstanding async external jobs**: any `.planning/async-jobs/*.json` manifests for non-terminal jobs — record job id, backend, status, expected artifacts, verification + resume commands, and any watcher/daemon state. Do NOT cancel the external job; it keeps running across the pause.
-10. **Blocking constraints**: Anti-patterns or methodological failures encountered during this session that a resuming agent MUST be aware of before proceeding. Only include items discovered through actual failure — not warnings or predictions. Assign each constraint a `severity`:
+2. **Session role** (if this session was operating under an assigned role — e.g. a named role in a multi-session/multi-role workflow such as "coordinator", "hardware operator", "design reviewer"): capture it verbatim so resume restores the same role instead of dropping it
+3. **Work completed**: What got done this session
+4. **Work remaining**: What's left in current plan/phase
+5. **Decisions made**: Key decisions and rationale
+6. **Blockers/issues**: Anything stuck
+7. **Human actions pending**: Things that need manual intervention (MCP setup, API keys, approvals, manual testing)
+8. **Background processes**: Any running servers/watchers that were part of the workflow
+9. **Files modified**: What's changed but not committed
+10. **Outstanding async external jobs**: any `.planning/async-jobs/*.json` manifests for non-terminal jobs — record job id, backend, status, expected artifacts, verification + resume commands, and any watcher/daemon state. Do NOT cancel the external job; it keeps running across the pause.
+11. **Blocking constraints**: Anti-patterns or methodological failures encountered during this session that a resuming agent MUST be aware of before proceeding. Only include items discovered through actual failure — not warnings or predictions. Assign each constraint a `severity`:
    - `blocking` — The resuming agent MUST demonstrate understanding before proceeding. The discuss-phase and execute-phase workflows will enforce a mandatory understanding check.
    - `advisory` — Important context but does not gate resumption.
 
@@ -69,7 +83,7 @@ Report any summaries with placeholder content as incomplete items.
 </step>
 
 <step name="write_structured">
-**Write structured handoff to `.planning/HANDOFF.json`:**
+**Write structured handoff to `.planning/${handoff_json_name}`** (session-id-keyed, e.g. `.planning/HANDOFF.<session_id>.json`; falls back to `.planning/HANDOFF.json` if `$CLAUDE_CODE_SESSION_ID` is unset):
 
 ```bash
 _GSD_SHIM_NAME="gsd-tools.cjs"; _GSD_RUNTIME_ROOT="${RUNTIME_DIR:-$(git rev-parse --show-toplevel 2>/dev/null || pwd)}"; GSD_TOOLS="${_GSD_RUNTIME_ROOT}/gsd-core/bin/${_GSD_SHIM_NAME}"; _gsd_at() { for _p; do if [ -f "$_p" ]; then GSD_TOOLS="$_p"; return 0; fi; done; return 1; }; _gsd_id_ok() { case "$("$1" runtime-identity --raw 2>/dev/null || true)" in '{"packageName":"@opengsd/gsd-core"'*'}') return 0;; *) return 1;; esac; }; _gsd_homes() { set -- "${CLAUDE_CONFIG_DIR:-$HOME/.claude}" "${ANTIGRAVITY_CONFIG_DIR:-$HOME/.gemini/antigravity}" "$HOME/.gemini/antigravity-ide" "$HOME/.gemini/antigravity-cli" "${AUGMENT_CONFIG_DIR:-$HOME/.augment}" "${CLINE_CONFIG_DIR:-$HOME/.cline}" "${CODEBUDDY_CONFIG_DIR:-$HOME/.codebuddy}" "${CODEX_HOME:-$HOME/.codex}" "${COPILOT_CONFIG_DIR:-${COPILOT_HOME:-$HOME/.copilot}}" "${CURSOR_CONFIG_DIR:-$HOME/.cursor}" "${HERMES_HOME:-$HOME/.hermes}" "${KILO_CONFIG_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/kilo}" "${KIMI_CONFIG_DIR:-$HOME/.config/agents}" "$HOME/.agents" "${KIMI_CODE_HOME:-$HOME/.kimi-code}" "${OPENCODE_CONFIG_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/opencode}" "${PI_CODING_AGENT_DIR:-$HOME/.pi/agent}" "${QWEN_CONFIG_DIR:-$HOME/.qwen}" "${TRAE_CONFIG_DIR:-$HOME/.trae}" "${WINDSURF_CONFIG_DIR:-$HOME/.codeium/windsurf}" "${ZCODE_CONFIG_DIR:-$HOME/.zcode}" "${GROK_AGENTS_HOME:-$HOME/.agents}"; for _h; do _gsd_at "$_h/gsd-core/bin/${_GSD_SHIM_NAME}" && return 0; done; return 1; }; if _gsd_at "${_GSD_RUNTIME_ROOT}/gsd-core/bin/${_GSD_SHIM_NAME}" "${_GSD_RUNTIME_ROOT}/.claude/gsd-core/bin/${_GSD_SHIM_NAME}" "${_GSD_RUNTIME_ROOT}/.codex/gsd-core/bin/${_GSD_SHIM_NAME}"; then gsd_run() { node "$GSD_TOOLS" "$@"; }; elif _gsd_homes; then gsd_run() { node "$GSD_TOOLS" "$@"; }; elif unset -f gsd_run; _G="$(command -v gsd_run)"; [ -n "$_G" ] && _gsd_id_ok "$_G"; then GSD_TOOLS="$_G"; gsd_run() { "$GSD_TOOLS" "$@"; }; else echo "ERROR: gsd-tools.cjs not found at $GSD_TOOLS and no identity-proving gsd_run is on PATH. Run: npx -y @opengsd/gsd-core@latest --claude --local" >&2; exit 1; fi; GSD_IDENTITY_STATUS=unverified; _gsd_id_ok gsd_run && GSD_IDENTITY_STATUS=ok; export GSD_IDENTITY_STATUS; [ "$GSD_IDENTITY_STATUS" = ok ] || echo "WARNING: \"$GSD_TOOLS\" did not prove it is @opengsd/gsd-core - it is either a different package or an @opengsd/gsd-core older than the runtime-identity verb. See docs/how-to/diagnose-a-foreign-gsd-tools.md" >&2; if [ -n "${CLAUDE_ENV_FILE:-}" ] && [ -n "${GSD_TOOLS:-}" ]; then printf "export PATH='%s':\"\$PATH\"\n" "${GSD_TOOLS%/*}" >> "$CLAUDE_ENV_FILE" 2>/dev/null || true; fi
@@ -80,6 +94,8 @@ timestamp=$(gsd_run query current-timestamp full --raw)
 {
   "version": "1.0",
   "timestamp": "{timestamp}",
+  "session_id": "{value of $CLAUDE_CODE_SESSION_ID, or \"unknown\" if unset}",
+  "role": "{this session's assigned role, e.g. \"coordinator\", \"hardware operator\" — omit or null if this session has no assigned role}",
   "phase": "{phase_number}",
   "phase_name": "{phase_name}",
   "phase_dir": "{phase_dir}",
@@ -128,7 +144,7 @@ UNCOMMITTED=$(git status --porcelain)
 </step>
 
 <step name="write">
-**Write handoff to the path determined in the detect step** (e.g. `.planning/phases/XX-name/.continue-here.md`, `.planning/spikes/SPIKE-NNN/.continue-here.md`, or `.planning/.continue-here.md`):
+**Write handoff to `${continue_here_name}` at the path determined in the detect step** (e.g. `.planning/phases/XX-name/${continue_here_name}`, `.planning/spikes/SPIKE-NNN/${continue_here_name}`, or `.planning/${continue_here_name}`):
 
 ```markdown
 ---
@@ -138,6 +154,7 @@ task: 3
 total_tasks: 7
 status: in_progress
 last_updated: [timestamp from current-timestamp]
+session_id: [value of $CLAUDE_CODE_SESSION_ID, or "unknown" if unset]
 ---
 
 # BLOCKING CONSTRAINTS — Read Before Anything Else
@@ -229,15 +246,15 @@ timestamp=$(gsd_run query current-timestamp full --raw)
 
 <step name="commit">
 ```bash
-gsd_run query commit "docs(pause): [context-name] paused at [X]/[Y]" --files [handoff-path] .planning/HANDOFF.json
+gsd_run query commit "docs(pause): [context-name] paused at [X]/[Y]" --files [handoff-path with ${continue_here_name}] .planning/${handoff_json_name}
 ```
 </step>
 
 <step name="confirm">
 ```
 ✓ Handoff created:
-  - .planning/HANDOFF.json (structured, machine-readable)
-  - [handoff-path] (human-readable)
+  - .planning/${handoff_json_name} (structured, machine-readable, keyed to this session)
+  - [handoff-path with ${continue_here_name}] (human-readable, keyed to this session)
 
 Current state:
 
@@ -257,7 +274,8 @@ To resume: /gsd:resume-work
 
 <success_criteria>
 - [ ] Context detected (phase/spike/deliberation/research/default)
-- [ ] .continue-here.md created at correct path for detected context
+- [ ] `${continue_here_name}` (session-id-keyed, e.g. `.continue-here.<session_id>.md`) created at correct path for detected context
+- [ ] `${handoff_json_name}` (session-id-keyed, e.g. `HANDOFF.<session_id>.json`) written to `.planning/`, including `session_id` and `role` (if applicable)
 - [ ] Required Reading, Anti-Patterns, and Infrastructure State sections filled
 - [ ] Pre-Execution Critique section filled if pausing between design and execution
 - [ ] Committed handoff
