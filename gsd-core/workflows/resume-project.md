@@ -71,8 +71,15 @@ Look for incomplete work that needs attention:
 # #2962: zsh aborts the block on an unmatched for-list glob (nomatch); bash passes it through. nullglob both.
 shopt -s nullglob 2>/dev/null; setopt NULL_GLOB 2>/dev/null
 
-# Check for structured handoff (preferred — machine-readable)
-cat .planning/HANDOFF.json 2>/dev/null || true
+# Check for structured handoff (preferred — machine-readable).
+# Use `find` rather than a fixed `cat .planning/HANDOFF.json`: gsd-pause-work
+# keys this filename by session id (`HANDOFF.<session_id>.json`) for the same
+# reason as the continue-here files below — a fixed name would let a second
+# concurrent session's pause silently overwrite an earlier one's handoff in
+# the same directory. `HANDOFF.json` with no id suffix is the legacy unkeyed
+# form from before this existed.
+session_id="${CLAUDE_CODE_SESSION_ID:-}"
+find .planning -maxdepth 1 -name 'HANDOFF*.json' -print 2>/dev/null || true
 
 # Check for continue-here files (phase + non-phase + legacy fallback).
 # Use `find` rather than a chained `ls` of bare globs: under zsh's default
@@ -81,6 +88,13 @@ cat .planning/HANDOFF.json 2>/dev/null || true
 # pattern after the first miss, including `.planning/.continue-here*.md`.
 # `find` does not use shell glob expansion and tolerates absent
 # directories on both bash and zsh.
+#
+# Filenames are keyed by session id (`.continue-here.<session_id>.md`) since
+# gsd-pause-work writes them that way — this lets a resuming session tell its
+# own paused work apart from a handoff left by a different, still-active
+# session in the same working directory (e.g. concurrent sessions on the
+# same repo). A bare `.continue-here.md` with no id suffix is the legacy
+# unkeyed form from before this existed.
 find .planning -maxdepth 3 -name '.continue-here*.md' -print 2>/dev/null || true
 find . -maxdepth 1 -name '.continue-here*.md' -print 2>/dev/null || true
 
@@ -107,17 +121,21 @@ fi
 **If HANDOFF.json exists:**
 
 - This is the primary resumption source — structured data from `/gsd:pause-work`
+- **If more than one `HANDOFF*.json` was found**, prefer the one whose filename contains `$session_id` (this session's own paused work). If none match `$session_id` (including when it's empty), treat the file(s) found as belonging to a different, possibly still-active session — surface it and confirm with the user before resuming from it, same as the `.continue-here` case below.
 - Parse `status`, `phase`, `plan`, `task`, `total_tasks`, `next_action`
+- **Restore `role` if present** — if this session is resuming under a specific assigned role (coordinator, hardware operator, design reviewer, etc.), the role must carry over; do not silently drop it. State the restored role back to the user as part of the resumption flag.
 - Check `blockers` and `human_actions_pending` — surface these immediately
 - Check `completed_tasks` for `in_progress` items — these need attention first
 - Validate `uncommitted_files` against `git status` — flag divergence
 - Use `context_notes` to restore mental model
-- Flag: "Found structured handoff — resuming from task {task}/{total_tasks}"
-- **After successful resumption, delete HANDOFF.json** (it's a one-shot artifact)
+- Flag: "Found structured handoff — resuming from task {task}/{total_tasks}" (append `, role: {role}` when a role was restored)
+- **After successful resumption, delete the HANDOFF file that was read** (it's a one-shot artifact) — delete only the matched file, not other sessions' `HANDOFF*.json`
 
 **If .continue-here file exists (phase/non-phase/legacy fallback):**
 
 - This is a mid-plan resumption point
+- **If more than one `.continue-here*.md` was found**, prefer the one whose filename contains `$session_id` (this session's own paused work) — read and resume from that one directly, no need to ask.
+- **If none match `$session_id`** (including when `$session_id` is empty), the file(s) found belong to a different session that may still be active. Do not silently treat it as this session's own history — surface it instead: "Found a paused handoff from a different session (`[filename]`, last updated [timestamp]) — resume from it, or start fresh?" and let the user decide.
 - Read the file for specific resumption context
 - Flag: "Found mid-plan checkpoint"
 
@@ -144,6 +162,7 @@ Phase: [X] of [Y] - [Phase name]
 Plan:  [A] of [B] - [Status]
 Progress: [██████░░░░] XX%
 Last activity: [date] - [what happened]
+[If HANDOFF.json carried a `role`:] Role: [restored role]
 
 [If incomplete work found:]
 ⚠️  Incomplete work detected:
