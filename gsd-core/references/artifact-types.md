@@ -54,7 +54,7 @@ reads is inert — the consumption mechanism is what gives an artifact meaning.
 ### HANDOFF.json / .continue-here.md
 - **Shape**: Structured pause state (JSON machine-readable + Markdown human-readable)
 - **Lifecycle**: Created on pause → Consumed on resume → Replaced by next pause
-- **Location**: `.planning/HANDOFF.json` + `.planning/phases/XX-name/.continue-here.md` (or spike/deliberation path)
+- **Location**: `.planning/HANDOFF.latest.<role_id>.json` + `.planning/phases/XX-name/.continue-here.latest.<role_id>.md` (or spike/deliberation path). Keyed by role so the file survives `/clear` as the role's single "paused, unclaimed" slot; sessions with no role use `<session_id>` instead of `latest.<role_id>`; the unkeyed names are legacy. Resume claims it by rename (`*.claimed.<role_id>.<session_id>.*`) and deletes it once the role is restored
 - **Consumed by**: `resume-project` workflow
 
 ---
