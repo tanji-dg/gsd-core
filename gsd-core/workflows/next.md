@@ -45,15 +45,15 @@ Print a one-line warning: `⚠ --force: skipping safety gates`
 Then proceed directly to `determine_next_action`. (Route 0 and `prior_phase_completeness` are NOT reached under `--force`.)
 
 **Gate 1: Unresolved checkpoint**
-Check if `.planning/.continue-here.md` exists:
+Check if any `.planning/.continue-here*.md` exists (the name is keyed by role or session id — see pause-work):
 ```bash
-[ -f .planning/.continue-here.md ]
+find .planning -maxdepth 1 -name '.continue-here*.md' 2>/dev/null | grep -q .
 ```
 If found:
 ```
 ⛔ Hard stop: Unresolved checkpoint
 
-`.planning/.continue-here.md` exists — a previous session left
+`.planning/.continue-here*.md` exists — a previous session left
 unfinished work that needs manual review before advancing.
 
 Read the file, resolve the issue, then delete it to continue.

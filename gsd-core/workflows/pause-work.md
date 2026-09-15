@@ -1,7 +1,7 @@
 @~/.claude/gsd-core/references/response-language-directive.md
 
 <purpose>
-Create structured `.planning/HANDOFF.json` and `.continue-here.md` handoff files to preserve complete work state across sessions. The JSON provides machine-readable state for `/gsd:resume-work`; the markdown provides human-readable context. Both filenames are keyed by session id (e.g. `HANDOFF.<session_id>.json`) so concurrent sessions paused in the same directory don't overwrite each other's handoff.
+Create structured `.planning/HANDOFF.json` and `.continue-here.md` handoff files to preserve complete work state across sessions. The JSON provides machine-readable state for `/gsd:resume-work`; the markdown provides human-readable context. Both filenames are keyed by the session's **role** when it has one (e.g. `HANDOFF.latest.design.json`) — the role is the identity that survives `/clear` and restarts, so the resuming session can find its own handoff and claim it. Sessions without a role fall back to a session-id key (`HANDOFF.<session_id>.json`) so concurrent sessions paused in the same directory still don't overwrite each other.
 </purpose>
 
 <required_reading>
@@ -16,12 +16,27 @@ Read all files referenced by the invoking prompt's execution_context before star
 Determine what kind of work is being paused and set the handoff destination accordingly:
 
 ```bash
-# Key the handoff filename by session id so concurrent sessions (e.g. multiple
-# Claude Code sessions paused in the same working directory) never overwrite
-# each other's handoff, and a resuming session can tell which one is its own.
-# Falls back to the unkeyed legacy filename if the env var isn't set (older client).
+# Key the handoff filename so that (a) concurrent sessions paused in the same
+# working directory never overwrite each other, and (b) the session that later
+# resumes can tell which handoff is its own.
+#
+# Preferred key: the session's ROLE (role_id — see the gather step). A session id
+# is NOT a usable key for (b): `/clear` and restarts issue a new
+# CLAUDE_CODE_SESSION_ID, so a session-id-keyed file is never matched by the
+# session that comes back, never gets deleted, and piles up (18+ stale files
+# were observed in one repo). The role survives that boundary. The role-keyed
+# file is a single "latest" slot per role — a new pause of the same role
+# overwrites it — and its presence means "this role is paused and unclaimed";
+# resume-work claims it (rename) and deletes it once the role is restored.
+#
+# Fallback key: session id, for sessions with no role (older behaviour). Legacy
+# unkeyed names are used only when the env var is unset (older client).
 session_id="${CLAUDE_CODE_SESSION_ID:-}"
-if [ -n "$session_id" ]; then
+role_id=""   # set in the gather step; leave empty when this session has no role
+if [ -n "$role_id" ]; then
+  continue_here_name=".continue-here.latest.${role_id}.md"
+  handoff_json_name="HANDOFF.latest.${role_id}.json"
+elif [ -n "$session_id" ]; then
   continue_here_name=".continue-here.${session_id}.md"
   handoff_json_name="HANDOFF.${session_id}.json"
 else
@@ -59,7 +74,8 @@ If phase is detected, proceed with phase handoff path. Otherwise use the first m
 **Collect complete state for handoff:**
 
 1. **Current position**: Which phase, which plan, which task
-2. **Session role** (if this session was operating under an assigned role — e.g. a named role in a multi-session/multi-role workflow such as "coordinator", "hardware operator", "design reviewer"): capture it verbatim so resume restores the same role instead of dropping it
+2. **Session role** (if this session was operating under an assigned role — e.g. a named role in a multi-session/multi-role workflow such as "coordinator", "hardware operator", "design reviewer"): capture it verbatim as `role` so resume restores the same role instead of dropping it. Prefer the project's own role registry as the source of truth when it has one (e.g. a per-session role file the project's statusline reads) over recalling the role from conversation — the two must not disagree.
+   - Also derive **`role_id`**: a short filesystem-safe slug of the role (`[a-z0-9-]+`, ASCII only — no spaces, no non-ASCII, since it becomes part of a filename). If the project defines its roles in files (e.g. `docs/roles/<slug>.md`), use that slug verbatim; otherwise lowercase the role's English name and join words with `-` (`hardware operator` → `hardware-operator`). Set `role_id` in the detect step's shell before computing the filenames. Leave it empty when the session has no role.
 3. **Work completed**: What got done this session
 4. **Work remaining**: What's left in current plan/phase
 5. **Decisions made**: Key decisions and rationale
@@ -83,7 +99,7 @@ Report any summaries with placeholder content as incomplete items.
 </step>
 
 <step name="write_structured">
-**Write structured handoff to `.planning/${handoff_json_name}`** (session-id-keyed, e.g. `.planning/HANDOFF.<session_id>.json`; falls back to `.planning/HANDOFF.json` if `$CLAUDE_CODE_SESSION_ID` is unset):
+**Write structured handoff to `.planning/${handoff_json_name}`** (role-keyed, e.g. `.planning/HANDOFF.latest.design.json`, overwriting any previous pause of the same role; session-id-keyed `.planning/HANDOFF.<session_id>.json` when the session has no role; `.planning/HANDOFF.json` only if `$CLAUDE_CODE_SESSION_ID` is also unset):
 
 ```bash
 _GSD_SHIM_NAME="gsd-tools.cjs"; _GSD_RUNTIME_ROOT="${RUNTIME_DIR:-$(git rev-parse --show-toplevel 2>/dev/null || pwd)}"; GSD_TOOLS="${_GSD_RUNTIME_ROOT}/gsd-core/bin/${_GSD_SHIM_NAME}"; _gsd_at() { for _p; do if [ -f "$_p" ]; then GSD_TOOLS="$_p"; return 0; fi; done; return 1; }; _gsd_id_ok() { case "$("$1" runtime-identity --raw 2>/dev/null || true)" in '{"packageName":"@opengsd/gsd-core"'*'}') return 0;; *) return 1;; esac; }; _gsd_homes() { _gsd_at "${CLAUDE_CONFIG_DIR:-$HOME/.claude}/gsd-core/bin/${_GSD_SHIM_NAME}" "${HERMES_HOME:-$HOME/.hermes}/gsd-core/bin/${_GSD_SHIM_NAME}" "${CURSOR_CONFIG_DIR:-$HOME/.cursor}/gsd-core/bin/${_GSD_SHIM_NAME}" "${CODEX_HOME:-$HOME/.codex}/gsd-core/bin/${_GSD_SHIM_NAME}" "${GEMINI_CONFIG_DIR:-$HOME/.gemini}/gsd-core/bin/${_GSD_SHIM_NAME}" "${COPILOT_CONFIG_DIR:-$HOME/.copilot}/gsd-core/bin/${_GSD_SHIM_NAME}" "${WINDSURF_CONFIG_DIR:-$HOME/.codeium/windsurf}/gsd-core/bin/${_GSD_SHIM_NAME}" "${AUGMENT_CONFIG_DIR:-$HOME/.augment}/gsd-core/bin/${_GSD_SHIM_NAME}" "${TRAE_CONFIG_DIR:-$HOME/.trae}/gsd-core/bin/${_GSD_SHIM_NAME}" "${QWEN_CONFIG_DIR:-$HOME/.qwen}/gsd-core/bin/${_GSD_SHIM_NAME}" "${CODEBUDDY_CONFIG_DIR:-$HOME/.codebuddy}/gsd-core/bin/${_GSD_SHIM_NAME}" "${CLINE_CONFIG_DIR:-$HOME/.cline}/gsd-core/bin/${_GSD_SHIM_NAME}" "${GROK_AGENTS_HOME:-$HOME/.agents}/gsd-core/bin/${_GSD_SHIM_NAME}" "${ANTIGRAVITY_CONFIG_DIR:-$HOME/.gemini/antigravity}/gsd-core/bin/${_GSD_SHIM_NAME}" "${OPENCODE_CONFIG_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/opencode}/gsd-core/bin/${_GSD_SHIM_NAME}" "${KILO_CONFIG_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/kilo}/gsd-core/bin/${_GSD_SHIM_NAME}"; }; if _gsd_at "${_GSD_RUNTIME_ROOT}/gsd-core/bin/${_GSD_SHIM_NAME}" "${_GSD_RUNTIME_ROOT}/.claude/gsd-core/bin/${_GSD_SHIM_NAME}" "${_GSD_RUNTIME_ROOT}/.codex/gsd-core/bin/${_GSD_SHIM_NAME}"; then gsd_run() { node "$GSD_TOOLS" "$@"; }; elif _gsd_homes; then gsd_run() { node "$GSD_TOOLS" "$@"; }; elif unset -f gsd_run; _G="$(command -v gsd_run)"; [ -n "$_G" ] && _gsd_id_ok "$_G"; then GSD_TOOLS="$_G"; gsd_run() { "$GSD_TOOLS" "$@"; }; else echo "ERROR: gsd-tools.cjs not found at $GSD_TOOLS and no identity-proving gsd_run is on PATH. Run: npx -y @opengsd/gsd-core@latest --claude --local" >&2; exit 1; fi; GSD_IDENTITY_STATUS=unverified; _gsd_id_ok gsd_run && GSD_IDENTITY_STATUS=ok; export GSD_IDENTITY_STATUS; [ "$GSD_IDENTITY_STATUS" = ok ] || echo "WARNING: \"$GSD_TOOLS\" did not prove it is @opengsd/gsd-core - it is either a different package or an @opengsd/gsd-core older than the runtime-identity verb. See docs/how-to/diagnose-a-foreign-gsd-tools.md" >&2; if [ -n "${CLAUDE_ENV_FILE:-}" ] && [ -n "${GSD_TOOLS:-}" ]; then printf "export PATH='%s':\"\$PATH\"\n" "${GSD_TOOLS%/*}" >> "$CLAUDE_ENV_FILE" 2>/dev/null || true; fi
@@ -95,7 +111,8 @@ timestamp=$(gsd_run query current-timestamp full --raw)
   "version": "1.0",
   "timestamp": "{timestamp}",
   "session_id": "{value of $CLAUDE_CODE_SESSION_ID, or \"unknown\" if unset}",
-  "role": "{this session's assigned role, e.g. \"coordinator\", \"hardware operator\" — omit or null if this session has no assigned role}",
+  "role": "{this session's assigned role, verbatim, e.g. \"coordinator\", \"hardware operator\" — omit or null if this session has no assigned role}",
+  "role_id": "{slug used in the filename, e.g. \"coordinator\", \"hardware-operator\" — omit or null when role is absent}",
   "phase": "{phase_number}",
   "phase_name": "{phase_name}",
   "phase_dir": "{phase_dir}",
@@ -155,6 +172,8 @@ total_tasks: 7
 status: in_progress
 last_updated: [timestamp from current-timestamp]
 session_id: [value of $CLAUDE_CODE_SESSION_ID, or "unknown" if unset]
+role: [assigned role verbatim — omit the line if none]
+role_id: [slug used in the filename — omit the line if none]
 ---
 
 # BLOCKING CONSTRAINTS — Read Before Anything Else
@@ -253,8 +272,8 @@ gsd_run query commit "wip: [context-name] paused at [X]/[Y]" --files [handoff-pa
 <step name="confirm">
 ```
 ✓ Handoff created:
-  - .planning/${handoff_json_name} (structured, machine-readable, keyed to this session)
-  - [handoff-path with ${continue_here_name}] (human-readable, keyed to this session)
+  - .planning/${handoff_json_name} (structured, machine-readable, keyed to this session's role — or session id if no role)
+  - [handoff-path with ${continue_here_name}] (human-readable, same key)
 
 Current state:
 
@@ -274,8 +293,9 @@ To resume: /gsd:resume-work
 
 <success_criteria>
 - [ ] Context detected (phase/spike/deliberation/research/default)
-- [ ] `${continue_here_name}` (session-id-keyed, e.g. `.continue-here.<session_id>.md`) created at correct path for detected context
-- [ ] `${handoff_json_name}` (session-id-keyed, e.g. `HANDOFF.<session_id>.json`) written to `.planning/`, including `session_id` and `role` (if applicable)
+- [ ] `role_id` derived (ASCII slug) when the session has a role, and the filenames keyed by it (`.continue-here.latest.<role_id>.md` / `HANDOFF.latest.<role_id>.json`); session-id key only when there is no role
+- [ ] `${continue_here_name}` created at correct path for detected context
+- [ ] `${handoff_json_name}` written to `.planning/`, including `session_id`, `role` and `role_id` (if applicable)
 - [ ] Required Reading, Anti-Patterns, and Infrastructure State sections filled
 - [ ] Pre-Execution Critique section filled if pausing between design and execution
 - [ ] Committed as WIP

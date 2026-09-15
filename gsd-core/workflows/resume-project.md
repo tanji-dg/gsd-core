@@ -73,11 +73,21 @@ shopt -s nullglob 2>/dev/null; setopt NULL_GLOB 2>/dev/null
 
 # Check for structured handoff (preferred — machine-readable).
 # Use `find` rather than a fixed `cat .planning/HANDOFF.json`: gsd-pause-work
-# keys this filename by session id (`HANDOFF.<session_id>.json`) for the same
-# reason as the continue-here files below — a fixed name would let a second
-# concurrent session's pause silently overwrite an earlier one's handoff in
-# the same directory. `HANDOFF.json` with no id suffix is the legacy unkeyed
-# form from before this existed.
+# keys this filename, for the same reason as the continue-here files below —
+# a fixed name would let a second concurrent session's pause silently
+# overwrite an earlier one's handoff in the same directory. Three forms exist:
+#   HANDOFF.latest.<role_id>.json  — role-keyed (current). One slot per role;
+#                                    its presence means "this role is paused
+#                                    and nobody has claimed it yet".
+#   HANDOFF.<session_id>.json      — session-id-keyed (sessions with no role).
+#                                    NOTE: a session id changes on `/clear` /
+#                                    restart, so the session that comes back
+#                                    will NOT match its own file — expect to
+#                                    ask the user rather than auto-match.
+#   HANDOFF.json                   — legacy unkeyed form.
+# `HANDOFF.claimed.<role_id>.<session_id>.json` is a role-keyed file that a
+# resuming session has already claimed (renamed) but not yet deleted — it
+# belongs to that session, not to whoever runs this next.
 session_id="${CLAUDE_CODE_SESSION_ID:-}"
 find .planning -maxdepth 1 -name 'HANDOFF*.json' -print 2>/dev/null || true
 
@@ -89,12 +99,12 @@ find .planning -maxdepth 1 -name 'HANDOFF*.json' -print 2>/dev/null || true
 # `find` does not use shell glob expansion and tolerates absent
 # directories on both bash and zsh.
 #
-# Filenames are keyed by session id (`.continue-here.<session_id>.md`) since
-# gsd-pause-work writes them that way — this lets a resuming session tell its
-# own paused work apart from a handoff left by a different, still-active
-# session in the same working directory (e.g. concurrent sessions on the
-# same repo). A bare `.continue-here.md` with no id suffix is the legacy
-# unkeyed form from before this existed.
+# Filenames are keyed the same way as HANDOFF*.json above:
+# `.continue-here.latest.<role_id>.md` (role-keyed, current),
+# `.continue-here.<session_id>.md` (no-role sessions), bare
+# `.continue-here.md` (legacy). This lets a resuming session tell its own
+# paused work apart from a handoff left by a different, still-active session
+# in the same working directory (e.g. concurrent sessions on the same repo).
 find .planning -maxdepth 3 -name '.continue-here*.md' -print 2>/dev/null || true
 find . -maxdepth 1 -name '.continue-here*.md' -print 2>/dev/null || true
 
@@ -121,21 +131,35 @@ fi
 **If HANDOFF.json exists:**
 
 - This is the primary resumption source — structured data from `/gsd:pause-work`
-- **If more than one `HANDOFF*.json` was found**, prefer the one whose filename contains `$session_id` (this session's own paused work). If none match `$session_id` (including when it's empty), treat the file(s) found as belonging to a different, possibly still-active session — surface it and confirm with the user before resuming from it, same as the `.continue-here` case below.
+- **Select which handoff is this session's**, in this order:
+  1. **Role-keyed (`HANDOFF.latest.<role_id>.json`)** — if this session's role is already known (the user said which role to resume as, or the project's role registry has this session registered), take the file for that `role_id`. If the role is not known and one or more `HANDOFF.latest.*.json` exist, list them by role and timestamp and ask which role to resume as — never pick one silently, since resuming under a role claims it.
+  2. **Session-id-keyed (`HANDOFF.<session_id>.json`)** — prefer one whose filename contains `$session_id`. This only matches within the same session (before `/clear`); after a restart it never will, so if none match, treat the file(s) as belonging to another session and confirm with the user before resuming from one.
+  3. **Legacy `HANDOFF.json`** — confirm with the user as in 2.
+  - Leave `HANDOFF.claimed.*` files alone unless the `<session_id>` in the name is this session's — they are another session's in-progress resumption.
+- **Claim a role-keyed handoff before reading it** — rename, don't copy, so two sessions resuming the same role at once cannot both succeed (rename is atomic; the loser gets a missing-file error and must re-list):
+  ```bash
+  mv .planning/HANDOFF.latest.${role_id}.json ".planning/HANDOFF.claimed.${role_id}.${session_id}.json"
+  ```
+  Do the same for the matching `.continue-here.latest.${role_id}.md` (in the phase dir or wherever it was found). If the `mv` fails because the file is gone, another session claimed the role — report that and stop; do not fall back to reading its `claimed.*` copy.
 - Parse `status`, `phase`, `plan`, `task`, `total_tasks`, `next_action`
-- **Restore `role` if present** — if this session is resuming under a specific assigned role (coordinator, hardware operator, design reviewer, etc.), the role must carry over; do not silently drop it. State the restored role back to the user as part of the resumption flag.
+- **Restore `role` if present** — if this session is resuming under a specific assigned role (coordinator, hardware operator, design reviewer, etc.), the role must carry over; do not silently drop it. If the project has a role registry (e.g. a statusline register command), register the role there now, as this session. State the restored role back to the user as part of the resumption flag.
 - Check `blockers` and `human_actions_pending` — surface these immediately
 - Check `completed_tasks` for `in_progress` items — these need attention first
 - Validate `uncommitted_files` against `git status` — flag divergence
 - Use `context_notes` to restore mental model
 - Flag: "Found structured handoff — resuming from task {task}/{total_tasks}" (append `, role: {role}` when a role was restored)
-- **After successful resumption, delete the HANDOFF file that was read** (it's a one-shot artifact) — delete only the matched file, not other sessions' `HANDOFF*.json`
+- **After successful resumption, delete the HANDOFF file that was read** (it's a one-shot artifact) — delete only the file this session claimed/matched, not other sessions' `HANDOFF*.json`. For a role-keyed handoff, delete both the `claimed.*` JSON and the claimed `.continue-here.*` markdown, and commit the deletion so the working tree doesn't carry a stale `D` (the pause was a WIP commit, so the content stays recoverable from git history):
+  ```bash
+  git rm -q .planning/HANDOFF.claimed.${role_id}.${session_id}.json [claimed continue-here path]
+  gsd_run query commit "chore: [role] handoff consumed by ${session_id:0:8}" --files .planning/HANDOFF.claimed.${role_id}.${session_id}.json [claimed continue-here path]
+  ```
+  Delete only once the role has actually been restored (and registered, where the project has a registry) — the file's absence is what tells the next session that the role is taken.
 
 **If .continue-here file exists (phase/non-phase/legacy fallback):**
 
 - This is a mid-plan resumption point
-- **If more than one `.continue-here*.md` was found**, prefer the one whose filename contains `$session_id` (this session's own paused work) — read and resume from that one directly, no need to ask.
-- **If none match `$session_id`** (including when `$session_id` is empty), the file(s) found belong to a different session that may still be active. Do not silently treat it as this session's own history — surface it instead: "Found a paused handoff from a different session (`[filename]`, last updated [timestamp]) — resume from it, or start fresh?" and let the user decide.
+- **Select the file the same way as for HANDOFF*.json above**: a role-keyed `.continue-here.latest.<role_id>.md` for this session's known role (ask which role if unknown, and claim it by `mv` to `.continue-here.claimed.<role_id>.<session_id>.md` before reading); otherwise a session-id-keyed one whose filename contains `$session_id` can be read directly, no need to ask.
+- **If none match this session** (no known role, no `$session_id` match, or `$session_id` empty), the file(s) found belong to a different session that may still be active. Do not silently treat it as this session's own history — surface it instead: "Found a paused handoff from a different session (`[filename]`, last updated [timestamp]) — resume from it, or start fresh?" and let the user decide.
 - Read the file for specific resumption context
 - Flag: "Found mid-plan checkpoint"
 
