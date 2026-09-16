@@ -90,7 +90,9 @@ If phase is detected, proceed with phase handoff path. Otherwise use the first m
    - `blocking` — The resuming agent MUST demonstrate understanding before proceeding. The discuss-phase and execute-phase workflows will enforce a mandatory understanding check.
    - `advisory` — Important context but does not gate resumption.
 
-Ask user for clarifications if needed via conversational questions.
+**Do not block on the user.** This workflow may be running unattended (an external watcher can send `/gsd:pause-work` while the user is away — see the `gsd-resume-hook` SessionStart hook). Ask a clarifying question only when the user is clearly present and the answer changes what gets written; otherwise write `unknown` for the item and say why in `context_notes` — never leave the pause half-written waiting for an answer.
+
+**Role source of truth**: when the project keeps a role registry (a per-session role file, `docs/roles/`, a statusline register command, …), take `role` and `role_id` from there — the registry's slug is the `role_id`, verbatim; do not re-derive it from the role's wording. Only derive the slug yourself when the project has no registry. If the registry has no entry for this session, leave both empty and note it.
 
 **Also inspect SUMMARY.md files for false completions:**
 ```bash
@@ -265,6 +267,35 @@ timestamp=$(gsd_run query current-timestamp full --raw)
 ```
 </step>
 
+<step name="skills">
+**Skill capture (optional, before committing).** Look back over this session for material that belongs in a reusable skill rather than only in the handoff:
+
+- a procedure worked out by trial and error that will be needed again
+- a trap that cost time and whose fix is a fixed command string or ordering
+- an existing skill that turned out to be wrong, incomplete, or hard to find from the action path
+
+If there is such material, create or update the skill now (the `skill-creator` skill for a new one; edit its `SKILL.md` directly for a fix) and record what changed in `<decisions_made>` and in the confirm step. If there is nothing, write one line `skills: no change` in the handoff's `<context>` — do not invent a skill to have something to report.
+</step>
+
+<step name="notify">
+**Notify the user only if they must act.** The user may not be watching this session. If, and only if, the pause ends with one of:
+
+- a decision only the user can make (a blocking `human_actions_pending`)
+- an external/physical state the user must see before the next session (a rig left in a temporary state, a tool left open, …)
+- a failure the resuming session cannot recover from on its own
+
+and the project configured a notifier — `.planning/config.json` `hooks.pause_notify_command` (a shell command; the one-line message is passed as `$GSD_PAUSE_MESSAGE` / `%GSD_PAUSE_MESSAGE%` and appended as the last argument) — send exactly one message:
+
+```bash
+notify_cmd=$(gsd_run config-get hooks.pause_notify_command --raw 2>/dev/null || true)
+if [ -n "$notify_cmd" ] && [ "$notify_cmd" != "null" ]; then
+  GSD_PAUSE_MESSAGE="⏸ pause [<role or role_id>]: <one line — what the user must decide/check>" sh -c "$notify_cmd \"\$GSD_PAUSE_MESSAGE\"" || true
+fi
+```
+
+Otherwise send nothing (a routine pause is not news). Note in the handoff whether a notification was sent.
+</step>
+
 <step name="record_session">
 **Record the pause as this session's continuity heartbeat** — through the verb, never by hand-editing STATE.md:
 
@@ -308,6 +339,8 @@ Current state:
 - Status: [in_progress/blocked]
 - Blockers: [count] ({human_actions_pending count} need human action)
 - Committed as WIP
+- Skills: [created/updated <name> | no change]
+- Notify: [sent: <one line> | not sent]
 
 To resume: /gsd:resume-work
 
@@ -325,5 +358,8 @@ To resume: /gsd:resume-work
 - [ ] Required Reading, Anti-Patterns, and Infrastructure State sections filled
 - [ ] Pre-Execution Critique section filled if pausing between design and execution
 - [ ] Committed as WIP
+- [ ] skills step done (created/updated, or `skills: no change` written in the handoff)
+- [ ] notify step done (sent only if the user must act, and only via `hooks.pause_notify_command`; recorded either way)
+- [ ] No blocking question was asked of the user (unknowns written as `unknown`)
 - [ ] User knows location and how to resume
 </success_criteria>
