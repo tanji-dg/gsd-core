@@ -1349,6 +1349,7 @@ fix(03-01): correct auth token expiry
 - REQ-HOOK-06: All hooks MUST fail silently on any error
 - REQ-HOOK-07: The context meter's 100% MUST be the token count at which Claude Code auto-compacts — the window from `CLAUDE_CODE_AUTO_COMPACT_WINDOW`, else the `autoCompactWindow` setting `/autocompact` saves (per model under `modelSettings`, or top-level), else the model window, minus the 33k auto-compact buffer and lowered by `CLAUDE_AUTOCOMPACT_PCT_OVERRIDE` — and MUST be the model window when auto-compact is off (`autoCompactEnabled: false` in settings, or `DISABLE_AUTO_COMPACT` / `DISABLE_COMPACT`). The bridge's `remaining_percentage` MUST count down to the same point, so the context monitor warns before compaction
 - REQ-HOOK-08: Update banner MUST be opt-in and silent unless an update is available (PR #2795)
+- REQ-HOOK-09: The SessionStart(clear) resume hook MUST claim nothing unless a fresh pending record addressed to its own Claude Code process exists; on success it MUST route through `state session-resume` and commit only the two `.latest` deletions (`git commit --only`); it MUST never block the session (see `docs/session-resume-hook.md`)
 
 **Statusline Display:**
 ```text
