@@ -52,6 +52,10 @@ import { platformWriteSync, platformReadSync, platformEnsureDir, retryRenameSync
 // eslint-disable-next-line @typescript-eslint/no-require-imports
 import planningWorkspace = require('./planning-workspace.cjs');
 const { planningDir, planningPaths, resolvePhaseIdConvention } = planningWorkspace;
+// Per-session continuity records + handoff discovery (concurrent sessions
+// sharing one .planning/ — see src/session-store.cts).
+// eslint-disable-next-line @typescript-eslint/no-require-imports
+import sessionStore = require('./session-store.cjs');
 import { realClock } from './clock.cjs';
 // eslint-disable-next-line @typescript-eslint/no-require-imports
 import frontmatter = require('./frontmatter.cjs');
@@ -394,6 +398,35 @@ interface StateAddRoadmapEvolutionOptions {
 interface StateRecordSessionOptions {
   stopped_at?: string;
   resume_file?: string | null;
+  /**
+   * Concurrent-session continuity: when a session id resolves (`--session`
+   * or a runtime env key — see session-store.cts resolveSessionId), the same
+   * fields are ALSO written to `.planning/sessions/<sid>.json`. The STATE.md
+   * `## Session` write is unchanged either way (many callers pin its bytes).
+   */
+  session?: string | null;
+  /** Verbatim role of the calling session (kept on the record until restated). */
+  role?: string | null;
+  /** Filesystem-safe role slug as pause-work.md derives it; defaults to slug(role). */
+  role_id?: string | null;
+}
+
+interface StateSessionResumeOptions {
+  session?: string | null;
+  role?: string | null;
+  role_id?: string | null;
+  /** The routed action, e.g. "execute-phase 3" — recorded as `Stopped at: Session resumed, proceeding to <action>`. */
+  action?: string | null;
+  /** Explicit handoff path to consume (adopting another session's handoff); must live at the .planning/ root. */
+  handoff?: string | null;
+  /** Leave every handoff in place (inspection / dry run of the status repair). */
+  keep_handoff?: boolean;
+}
+
+interface StateSessionsOptions {
+  session?: string | null;
+  role?: string | null;
+  role_id?: string | null;
 }
 
 interface StateSnapshotSession {
@@ -2141,6 +2174,336 @@ function boundedContinuation(text: string): string {
   return `${text.slice(0, end)}…`;
 }
 
+/**
+ * The `state record-session` STATE.md transform, lifted out of
+ * cmdStateRecordSession so `state session-resume` can reuse it verbatim
+ * (concurrent-session continuity; see src/session-store.cts). Pure over
+ * `content`; reports through the caller-owned `updated` array and
+ * `flags.sessionCreated`. Output is byte-identical to the pre-lift closure.
+ */
+function applyRecordSessionTransform(
+  content: string,
+  options: StateRecordSessionOptions,
+  now: string,
+  updated: string[],
+  flags: { sessionCreated: boolean },
+  ctx: {
+    priorRecord: { stoppedAt?: string; resumeFile?: string };
+    skippedFields: { field: string; reason: 'wrapped_value' | 'line_separator' | 'unclosed_fence'; continuation?: string }[];
+    skipWrapped: (field: string, before: string, after: string) => boolean;
+  },
+): string {
+  const { priorRecord, skippedFields, skipWrapped } = ctx;
+  // #4998 review (trek-e 5608265301, Major 1): every field written here is read
+  // from the session section when there is one (`## Session`, else `## Session
+  // Continuity` — matchSessionSection, state-snapshot, the frontmatter sync), so
+  // it is written there too. A line outside that section is not the field: a
+  // write that landed on it reported success while the synced value stayed
+  // stale. With no session section only `Stopped At` is read from the whole
+  // body (sessionFieldScope); `state-snapshot` reads Last session and Resume
+  // file from a session section alone, so with none they are not written in
+  // place but in the section appended below, as `state update`/`patch` refuse
+  // them (#4998 review, Minor 3). Located on the masked text (same offsets).
+  const readBodyWide = (fieldName: string): boolean => fieldName.toLowerCase() === 'stopped at';
+  const sessionSection = () => {
+    const masked = maskFencedLines(content, { document: true });
+    return collectSection(masked, isSessionHeading, { levelBounded: true })
+      ?? collectSection(masked, isSessionContinuityHeading, { levelBounded: true });
+  };
+  const inSessionScope = (fieldName: string, write: (visible: string) => string | null): string | null => {
+    const section = sessionSection();
+    if (!section) return readBodyWide(fieldName) ? writeOutsideFences(content, write, { document: true }) : null;
+    const body = writeOutsideFences(content.slice(section.bodyStart, section.bodyEnd), write);
+    return body === null ? null : replaceSection(content, section, body);
+  };
+  const sessionScopeText = (fieldName: string): string => {
+    const masked = maskFencedLines(content, { document: true });
+    const section = sessionSection();
+    if (!section && !readBodyWide(fieldName)) return '';
+    return readableBoldLabels(section ? masked.slice(section.bodyStart, section.bodyEnd) : masked);
+  };
+  // #4763 (1): read the pre-write session record. The capture mirrors the
+  // WRITER: the first case-insensitive label match in the scope above, so a
+  // line the writer did not displace is not reported as displaced. Continuation lines join via
+  // stateFieldContinuation (the sanctioned joiner — stateExtractField alone is
+  // first-line-only), so a wrapped multi-line handoff is surfaced whole.
+  // #4998: a line inside a fenced block is an example, not a field — the
+  // writers below skip fences (`writeOutsideFences`), so the capture reads
+  // the same unfenced text they write.
+  // A `**Label**:` line the writer can replace is read too (readableBoldLabels).
+  const capturePrior = (fieldName: string): string | undefined => {
+    const visible = sessionScopeText(fieldName);
+    const first = stateExtractField(visible, fieldName);
+    if (first === null) return undefined;
+    const cont = stateFieldContinuation(visible, fieldName);
+    return cont ? `${first}\n${cont}` : first;
+  };
+  // #4998: with no body line, the frontmatter `stopped_at` is the only copy of
+  // the record, and the sync re-derives it from the line inserted below — a
+  // displacement like any other, so it is the prior record too.
+  const fmStoppedAt = extractFrontmatter(content)['stopped_at'];
+  priorRecord.stoppedAt = capturePrior('Stopped At')
+    ?? (typeof fmStoppedAt === 'string' && fmStoppedAt.trim() ? fmStoppedAt.trim() : undefined);
+  priorRecord.resumeFile = capturePrior('Resume File');
+
+  // #4998: every in-place write skips fenced blocks, as the insertion
+  // below does — a fenced example line is never the occurrence replaced.
+  const replaceField = (fieldName: string, value: string): string | null =>
+    inSessionScope(fieldName, (visible) => stateReplaceField(visible, fieldName, value));
+  // The template check reads the field the way the writer finds it: an
+  // authored `**Resume file**: plan.md` read as absent and was reset to None.
+  const replaceFieldIfTemplate = (fieldName: string, defaults: string[], value: string): string => {
+    const current = stateExtractField(sessionScopeText(fieldName), fieldName);
+    if (current !== null && current.trim() !== ''
+        && !defaults.some((d) => d.toLowerCase() === current.trim().toLowerCase())) return content;
+    return inSessionScope(fieldName, (visible) => stateReplaceFieldIfTemplate(visible, fieldName, defaults, value)) ?? content;
+  };
+
+  // Update Last session / Last Date
+  let result = replaceField('Last session', now);
+  if (result && !skipWrapped('Last session', content, result)) { content = result; updated.push('Last session'); }
+  result = replaceField('Last Date', now);
+  if (result && !skipWrapped('Last Date', content, result)) { content = result; updated.push('Last Date'); }
+
+  // Update Stopped at
+  // #3374 Variant B: stateReplaceField returns the replaced string on any
+  // label MATCH, including when the value is already the target. Pushing
+  // 'Stopped At' on match alone reported a write that never changed a byte
+  // (and that the #948 no-op guard may then discard entirely), leaving a
+  // stale frontmatter stopped_at undetectable to the caller. Report only on
+  // real change — and track the match separately so an identical value does
+  // not read as "label missing" to the #944 DWIM insertion below (whose
+  // section rewrite would reset an executor-authored resume file to None).
+  let stoppedAtMatched = false;
+  if (options.stopped_at) {
+    result = replaceField('Stopped At', options.stopped_at);
+    if (!result) result = replaceField('Stopped at', options.stopped_at);
+    if (result) {
+      stoppedAtMatched = true;
+      if (result !== content && !skipWrapped('Stopped At', content, result)) { content = readableEditedBoldLabel(content, result); updated.push('Stopped At'); }
+    }
+  }
+
+  // Update Resume File — only when the caller explicitly passed a value OR the
+  // existing value is a known template default.  An executor-authored path must
+  // not be silently replaced with 'None' just because --resume-file was omitted
+  // (Knuth invariant: handler-owns-transition-between-known-template-defaults).
+  const resumeFileDefaults = KNOWN_TEMPLATE_DEFAULTS['Resume File'];
+  if (options.resume_file !== undefined && options.resume_file !== null) {
+    // Caller explicitly passed a value — always honour it.
+    result = replaceField('Resume File', options.resume_file);
+    if (!result) result = replaceField('Resume file', options.resume_file);
+    if (result && !skipWrapped('Resume File', content, result)) { content = readableEditedBoldLabel(content, result); updated.push('Resume File'); }
+  } else {
+    // No explicit value — only set 'None' when existing value is also a known default
+    // (i.e. not executor-authored).
+    let newRf = replaceFieldIfTemplate('Resume File', resumeFileDefaults, 'None');
+    // Try alternate capitalisation
+    if (newRf === content) newRf = replaceFieldIfTemplate('Resume file', resumeFileDefaults, 'None');
+    if (newRf !== content && !skipWrapped('Resume File', content, newRf)) {
+      content = newRf;
+      updated.push('Resume File');
+    }
+  }
+
+  // Bug #944: DWIM normalize/auto-create — when the caller supplied --stopped-at or
+  // --resume-file but the body lacks the canonical labels (in-place replace
+  // returned a miss), persist the values durably. Mirrors the DWIM pattern used
+  // by add-decision, add-blocker, and record-metric. Never silently drop
+  // caller-supplied values.
+  //
+  // Guard: only act when the caller actually supplied a value. When no
+  // --stopped-at / --resume-file are given and the body already had no session
+  // labels (nothing was updated), we return recorded:false — the existing
+  // behaviour for a no-op call that didn't supply any values.
+  //
+  // Correctness invariant: both buildStateFrontmatter and cmdStateSnapshot read
+  // only the FIRST `## Session` block (via a /##\s*Session\s*\n…/i regex).
+  // If we blindly append a second `## Session` block when one already exists, the
+  // newly-written Stopped at / Resume file end up in the second (invisible) block.
+  // Fix: when a `## Session` heading already exists, normalize THAT block in place
+  // (insert / replace canonical bold-label lines within the existing section).
+  // A `## Session Continuity` heading (bootstrap shape) is handled additively —
+  // missing canonical fields are inserted while the heading and any prose are
+  // preserved (#1101). Only append a brand-new section when NEITHER heading exists.
+  const callerSuppliedValues = !!(options.stopped_at || (options.resume_file !== undefined && options.resume_file !== null));
+  // #3374: keyed on the label MATCH, not on updated[] — a matched-but-
+  // identical value is already persisted on disk and must not trigger the
+  // insertion rewrite below.
+  const needsStoppedAt = options.stopped_at && !stoppedAtMatched;
+  // #4998: a field skipped as wrapped is present, not missing.
+  const skipped = (field: string): boolean => skippedFields.some((s) => s.field === field);
+  const needsResumeFile = options.resume_file !== undefined && options.resume_file !== null
+    && !updated.includes('Resume File') && !skipped('Resume File');
+  const needsLastSession = !updated.includes('Last session') && !updated.includes('Last Date')
+    && !skipped('Last session') && !skipped('Last Date');
+
+  if (callerSuppliedValues && (needsStoppedAt || needsResumeFile || needsLastSession)) {
+    const resumeValue = (options.resume_file !== undefined && options.resume_file !== null)
+      ? options.resume_file
+      : 'None';
+    const stoppedAtValue = options.stopped_at || 'None';
+
+    // Determine whether a session heading already exists in the body. The
+    // canonical normalized form is `## Session`; the bootstrap templates
+    // (workstream.cts, gsd2-import.cts, templates/state.md) instead emit
+    // `## Session Continuity`. Treat each separately so we never append a
+    // duplicate section alongside an existing one.
+    // #4998: a heading inside a fenced example is not a section. Detected
+    // with the locator the writers below and the readers use (#4998 review).
+    const headingScan = maskFencedLines(content, { document: true });
+    const existingCanonicalSession = collectSection(headingScan, isSessionHeading, { levelBounded: true }) !== null;
+    const existingSessionContinuity = collectSection(headingScan, isSessionContinuityHeading, { levelBounded: true }) !== null;
+
+    // Track whether the chosen branch's rewrite actually matched. The detector
+    // and the writer share one locator (CRLF-tolerant: the tokenizer strips
+    // a trailing \r). If the writer still fails to match (line-ending
+    // mismatch, unexpected heading shape, ...), do NOT report success — the
+    // caller would believe fields were persisted that were silently dropped
+    // (#2450). The append branch always sets rewriteMatched=true (it always
+    // mutates content).
+    let rewriteMatched = false;
+    // `created` means a session section was added, as in record-metric and
+    // add-decision — not a field inserted into an existing one (#4998 review).
+    let sectionAppended = false;
+
+    // #4998: insert each missing field into `region`,
+    // in the section's own spelling and in template order (Last session →
+    // Stopped at → Resume file), beside the sibling it follows — a bold
+    // `**Stopped at:**` above plain `Last session:` lines is a line the
+    // template does not define. With no sibling present it goes right after
+    // the heading in bold, the pre-#4998 shape. Every existing line is kept.
+    // A heading at EOF with no line terminator gets one first, so its body
+    // exists to insert into rather than a field being glued onto it.
+    // The section is located on the masked text (same offsets): a fenced
+    // `## Session` example is not the section, and a ``` in a frontmatter
+    // block scalar does not hide the real one (Codex review round 2).
+    const insertIntoSection = (isTarget: (h: HeadingToken) => boolean): void => {
+      let section = collectSection(maskFencedLines(content, { document: true }), isTarget, { levelBounded: true });
+      if (section && content[section.bodyStart - 1] !== '\n' && section.bodyStart >= content.length) {
+        content += content.includes('\r\n') ? '\r\n' : '\n';
+        section = collectSection(maskFencedLines(content, { document: true }), isTarget, { levelBounded: true });
+      }
+      if (!section || content[section.bodyStart - 1] !== '\n') return;
+      const body = insertMissingSessionFields(content.slice(section.bodyStart, section.bodyEnd), [
+        { label: 'Last session', needed: needsLastSession, value: now },
+        { label: 'Stopped at', needed: !!needsStoppedAt, value: stoppedAtValue },
+        { label: 'Resume file', needed: needsResumeFile, value: resumeValue },
+      ]);
+      content = replaceSection(content, section, body);
+      rewriteMatched = true;
+    };
+
+    if (existingCanonicalSession) {
+      // #4998: insert the missing fields in place. This used to replace the
+      // whole section with three canonical lines, which deleted any wrapped
+      // value or note in it — and reset an authored Resume file to None.
+      insertIntoSection(isSessionHeading);
+    } else if (existingSessionContinuity) {
+      // #1101: a `## Session Continuity` section already exists (bootstrap
+      // shape). Previously this fell through to the append branch and created
+      // a SECOND `## Session` block — a duplicate. Instead, insert only the
+      // canonical fields that are still missing (#4998: beside their siblings),
+      // preserving the `## Session Continuity` heading and ALL existing lines
+      // (e.g. prose like "Next recommended action"). Fields already updated in
+      // place above (needs* false) are not re-inserted. A function replacement
+      // is used so `$`-bearing caller values are inserted literally (#3454).
+      //
+      // Heading match is case-insensitive and CRLF-tolerant like the
+      // `existingSessionContinuity` detection above (#1101 review F3, #2450):
+      // a detected heading the writer then misses would report fields as
+      // updated that were never written (`rewriteMatched` stays false).
+      insertIntoSection(isSessionContinuityHeading);
+    } else {
+      // No session heading exists at all — append a new canonical section.
+      // #4998: the appended section becomes the one the sync reads, so a
+      // field this call is not setting carries the value the sync reads
+      // today (a body line, a wrapped field's first line, a table row)
+      // rather than None or nothing — which dropped the frontmatter
+      // `stopped_at` and reset an authored Resume file. Later writes then
+      // land on these bold lines first. A field skipped above as wrapped
+      // carries its existing value too — Last session included — so a
+      // skipped field never comes back carrying the new value.
+      // Read from the body, as the sync does — never from frontmatter, and
+      // never from a fenced example.
+      const syncBody = readableBoldLabels(maskFencedLines(stripFrontmatter(content)));
+      const carried = (fields: readonly string[], fallback: string): string => {
+        for (const field of fields) {
+          const value = stateExtractField(syncBody, field);
+          if (value !== null) return value;
+        }
+        return fallback;
+      };
+      const lastSessionValue = skipped('Last session') || skipped('Last Date')
+        ? carried(['Last session', 'Last Date'], now)
+        : now;
+      const scaffoldFields: [string, string][] = [
+        ['Last session', lastSessionValue],
+        ['Stopped at', needsStoppedAt ? stoppedAtValue : carried(['Stopped At'], stoppedAtValue)],
+        ['Resume file', needsResumeFile ? resumeValue : carried(['Resume File'], resumeValue)],
+      ];
+      // A document that ends inside an unclosed fence would swallow the
+      // appended section — nothing reads it there. Write nothing, and say so.
+      // The whole document is scanned on purpose: whether its tail is fenced
+      // depends on every delimiter before it (frontmatter excluded: YAML, not
+      // Markdown), and `scanFencedBlocks` reports
+      // an unclosed block only as its LAST record (the fence runs to EOF), so
+      // `closeLineIdx === -1` here means exactly "the tail is inside a fence".
+      if (markdownFencedBlocks(content.split('\n'), { document: true }).some((b) => b.closeLineIdx === -1)) {
+        // Named only for a field this call writes (Last session always, the
+        // others when passed) and not already written in place or skipped
+        // for another reason (Codex review; trek-e review 5608265301, Minor 3).
+        const fieldKey = (f: string): string => (f === 'Last Date' ? 'last session' : f.toLowerCase());
+        const requested = new Set(['last session']);
+        if (options.stopped_at) requested.add('stopped at');
+        if (options.resume_file !== undefined && options.resume_file !== null) requested.add('resume file');
+        const settled = new Set([...updated, ...skippedFields.map((s) => s.field)].map(fieldKey));
+        // A Stopped at already holding the value needs no write (Codex review).
+        if (stoppedAtMatched) settled.add('stopped at');
+        for (const [label] of scaffoldFields) {
+          const key = fieldKey(label);
+          if (requested.has(key) && !settled.has(key)) skippedFields.push({ field: label, reason: 'unclosed_fence' });
+        }
+      } else {
+        // A carried value holding a line separator (a hand-written table cell
+        // can) would forge a line once written as a bold field: leave that
+        // field out, and say so.
+        const scaffoldLines: string[] = [];
+        for (const [label, value] of scaffoldFields) {
+          if (FIELD_LINE_BREAK_RE.test(value)) skippedFields.push({ field: label, reason: 'line_separator' });
+          else scaffoldLines.push(`**${label}:** ${value}`);
+        }
+        const scaffold = ['', '## Session', '', ...scaffoldLines, ''].join('\n');
+        content = content.trimEnd() + '\n' + scaffold;
+        rewriteMatched = true;
+        sectionAppended = true;
+      }
+    }
+
+    // #2450 defensive invariant: only report sessionCreated/updated when the
+    // chosen branch's rewrite actually mutated content. Unreachable when the
+    // writer regexes above stay in sync with the CRLF-tolerant detector —
+    // but unreachable-defensive is the right posture for a silent-success
+    // gate. A no-op replace here means a future line-ending or shape drift
+    // between detector and writer; fail to record rather than claim success.
+    //
+    // Scope limitation (not a regression of this fix): the gate covers only
+    // the section-rewrite block. The earlier in-place stateReplaceField
+    // successes at :1081/:1083/:1089/:1101/:1108/:1114 push to `updated`
+    // unconditionally — those represent fields that DID land on disk via
+    // same-line replace (CRLF-agnostic seam), so unconditional push is
+    // correct. The class-defect防御 here is for the INSERT path only.
+    if (rewriteMatched) {
+      flags.sessionCreated = sectionAppended;
+      if (needsLastSession) updated.push('Last session');
+      if (needsStoppedAt) updated.push('Stopped At');
+      if (needsResumeFile) updated.push('Resume File');
+    }
+  }
+
+  return content;
+}
+
 function cmdStateRecordSession(cwd: string, options: StateRecordSessionOptions, raw: boolean): void {
   // #4186: a bare invocation is a usage error, not a heartbeat write. The
   // pre-#4186 handler accepted zero arguments and still refreshed
@@ -2165,7 +2528,6 @@ function cmdStateRecordSession(cwd: string, options: StateRecordSessionOptions, 
 
   const now = realClock.nowIso();
   const updated: string[] = [];
-  let sessionCreated = false;
   const divergedFields: string[] = [];
   // #4763 (1): last-writer-wins stays (the recorded single-slot handoff design),
   // but a displaced record is no longer silent. The pre-write session record is
@@ -2189,316 +2551,18 @@ function cmdStateRecordSession(cwd: string, options: StateRecordSessionOptions, 
     return true;
   };
 
+  const flags = { sessionCreated: false };
   readModifyWriteStateMd(statePath, (content) => {
-    // #4998 review (trek-e 5608265301, Major 1): every field written here is read
-    // from the session section when there is one (`## Session`, else `## Session
-    // Continuity` — matchSessionSection, state-snapshot, the frontmatter sync), so
-    // it is written there too. A line outside that section is not the field: a
-    // write that landed on it reported success while the synced value stayed
-    // stale. With no session section only `Stopped At` is read from the whole
-    // body (sessionFieldScope); `state-snapshot` reads Last session and Resume
-    // file from a session section alone, so with none they are not written in
-    // place but in the section appended below, as `state update`/`patch` refuse
-    // them (#4998 review, Minor 3). Located on the masked text (same offsets).
-    const readBodyWide = (fieldName: string): boolean => fieldName.toLowerCase() === 'stopped at';
-    const sessionSection = () => {
-      const masked = maskFencedLines(content, { document: true });
-      return collectSection(masked, isSessionHeading, { levelBounded: true })
-        ?? collectSection(masked, isSessionContinuityHeading, { levelBounded: true });
-    };
-    const inSessionScope = (fieldName: string, write: (visible: string) => string | null): string | null => {
-      const section = sessionSection();
-      if (!section) return readBodyWide(fieldName) ? writeOutsideFences(content, write, { document: true }) : null;
-      const body = writeOutsideFences(content.slice(section.bodyStart, section.bodyEnd), write);
-      return body === null ? null : replaceSection(content, section, body);
-    };
-    const sessionScopeText = (fieldName: string): string => {
-      const masked = maskFencedLines(content, { document: true });
-      const section = sessionSection();
-      if (!section && !readBodyWide(fieldName)) return '';
-      return readableBoldLabels(section ? masked.slice(section.bodyStart, section.bodyEnd) : masked);
-    };
-    // #4763 (1): read the pre-write session record. The capture mirrors the
-    // WRITER: the first case-insensitive label match in the scope above, so a
-    // line the writer did not displace is not reported as displaced. Continuation lines join via
-    // stateFieldContinuation (the sanctioned joiner — stateExtractField alone is
-    // first-line-only), so a wrapped multi-line handoff is surfaced whole.
-    // #4998: a line inside a fenced block is an example, not a field — the
-    // writers below skip fences (`writeOutsideFences`), so the capture reads
-    // the same unfenced text they write.
-    // A `**Label**:` line the writer can replace is read too (readableBoldLabels).
-    const capturePrior = (fieldName: string): string | undefined => {
-      const visible = sessionScopeText(fieldName);
-      const first = stateExtractField(visible, fieldName);
-      if (first === null) return undefined;
-      const cont = stateFieldContinuation(visible, fieldName);
-      return cont ? `${first}\n${cont}` : first;
-    };
-    // #4998: with no body line, the frontmatter `stopped_at` is the only copy of
-    // the record, and the sync re-derives it from the line inserted below — a
-    // displacement like any other, so it is the prior record too.
-    const fmStoppedAt = extractFrontmatter(content)['stopped_at'];
-    priorRecord.stoppedAt = capturePrior('Stopped At')
-      ?? (typeof fmStoppedAt === 'string' && fmStoppedAt.trim() ? fmStoppedAt.trim() : undefined);
-    priorRecord.resumeFile = capturePrior('Resume File');
-
-    // #4998: every in-place write skips fenced blocks, as the insertion
-    // below does — a fenced example line is never the occurrence replaced.
-    const replaceField = (fieldName: string, value: string): string | null =>
-      inSessionScope(fieldName, (visible) => stateReplaceField(visible, fieldName, value));
-    // The template check reads the field the way the writer finds it: an
-    // authored `**Resume file**: plan.md` read as absent and was reset to None.
-    const replaceFieldIfTemplate = (fieldName: string, defaults: string[], value: string): string => {
-      const current = stateExtractField(sessionScopeText(fieldName), fieldName);
-      if (current !== null && current.trim() !== ''
-          && !defaults.some((d) => d.toLowerCase() === current.trim().toLowerCase())) return content;
-      return inSessionScope(fieldName, (visible) => stateReplaceFieldIfTemplate(visible, fieldName, defaults, value)) ?? content;
-    };
-
-    // Update Last session / Last Date
-    let result = replaceField('Last session', now);
-    if (result && !skipWrapped('Last session', content, result)) { content = result; updated.push('Last session'); }
-    result = replaceField('Last Date', now);
-    if (result && !skipWrapped('Last Date', content, result)) { content = result; updated.push('Last Date'); }
-
-    // Update Stopped at
-    // #3374 Variant B: stateReplaceField returns the replaced string on any
-    // label MATCH, including when the value is already the target. Pushing
-    // 'Stopped At' on match alone reported a write that never changed a byte
-    // (and that the #948 no-op guard may then discard entirely), leaving a
-    // stale frontmatter stopped_at undetectable to the caller. Report only on
-    // real change — and track the match separately so an identical value does
-    // not read as "label missing" to the #944 DWIM insertion below (whose
-    // section rewrite would reset an executor-authored resume file to None).
-    let stoppedAtMatched = false;
-    if (options.stopped_at) {
-      result = replaceField('Stopped At', options.stopped_at);
-      if (!result) result = replaceField('Stopped at', options.stopped_at);
-      if (result) {
-        stoppedAtMatched = true;
-        if (result !== content && !skipWrapped('Stopped At', content, result)) { content = readableEditedBoldLabel(content, result); updated.push('Stopped At'); }
-      }
-    }
-
-    // Update Resume File — only when the caller explicitly passed a value OR the
-    // existing value is a known template default.  An executor-authored path must
-    // not be silently replaced with 'None' just because --resume-file was omitted
-    // (Knuth invariant: handler-owns-transition-between-known-template-defaults).
-    const resumeFileDefaults = KNOWN_TEMPLATE_DEFAULTS['Resume File'];
-    if (options.resume_file !== undefined && options.resume_file !== null) {
-      // Caller explicitly passed a value — always honour it.
-      result = replaceField('Resume File', options.resume_file);
-      if (!result) result = replaceField('Resume file', options.resume_file);
-      if (result && !skipWrapped('Resume File', content, result)) { content = readableEditedBoldLabel(content, result); updated.push('Resume File'); }
-    } else {
-      // No explicit value — only set 'None' when existing value is also a known default
-      // (i.e. not executor-authored).
-      let newRf = replaceFieldIfTemplate('Resume File', resumeFileDefaults, 'None');
-      // Try alternate capitalisation
-      if (newRf === content) newRf = replaceFieldIfTemplate('Resume file', resumeFileDefaults, 'None');
-      if (newRf !== content && !skipWrapped('Resume File', content, newRf)) {
-        content = newRf;
-        updated.push('Resume File');
-      }
-    }
-
-    // Bug #944: DWIM normalize/auto-create — when the caller supplied --stopped-at or
-    // --resume-file but the body lacks the canonical labels (in-place replace
-    // returned a miss), persist the values durably. Mirrors the DWIM pattern used
-    // by add-decision, add-blocker, and record-metric. Never silently drop
-    // caller-supplied values.
-    //
-    // Guard: only act when the caller actually supplied a value. When no
-    // --stopped-at / --resume-file are given and the body already had no session
-    // labels (nothing was updated), we return recorded:false — the existing
-    // behaviour for a no-op call that didn't supply any values.
-    //
-    // Correctness invariant: both buildStateFrontmatter and cmdStateSnapshot read
-    // only the FIRST `## Session` block (via a /##\s*Session\s*\n…/i regex).
-    // If we blindly append a second `## Session` block when one already exists, the
-    // newly-written Stopped at / Resume file end up in the second (invisible) block.
-    // Fix: when a `## Session` heading already exists, normalize THAT block in place
-    // (insert / replace canonical bold-label lines within the existing section).
-    // A `## Session Continuity` heading (bootstrap shape) is handled additively —
-    // missing canonical fields are inserted while the heading and any prose are
-    // preserved (#1101). Only append a brand-new section when NEITHER heading exists.
-    const callerSuppliedValues = !!(options.stopped_at || (options.resume_file !== undefined && options.resume_file !== null));
-    // #3374: keyed on the label MATCH, not on updated[] — a matched-but-
-    // identical value is already persisted on disk and must not trigger the
-    // insertion rewrite below.
-    const needsStoppedAt = options.stopped_at && !stoppedAtMatched;
-    // #4998: a field skipped as wrapped is present, not missing.
-    const skipped = (field: string): boolean => skippedFields.some((s) => s.field === field);
-    const needsResumeFile = options.resume_file !== undefined && options.resume_file !== null
-      && !updated.includes('Resume File') && !skipped('Resume File');
-    const needsLastSession = !updated.includes('Last session') && !updated.includes('Last Date')
-      && !skipped('Last session') && !skipped('Last Date');
-
-    if (callerSuppliedValues && (needsStoppedAt || needsResumeFile || needsLastSession)) {
-      const resumeValue = (options.resume_file !== undefined && options.resume_file !== null)
-        ? options.resume_file
-        : 'None';
-      const stoppedAtValue = options.stopped_at || 'None';
-
-      // Determine whether a session heading already exists in the body. The
-      // canonical normalized form is `## Session`; the bootstrap templates
-      // (workstream.cts, gsd2-import.cts, templates/state.md) instead emit
-      // `## Session Continuity`. Treat each separately so we never append a
-      // duplicate section alongside an existing one.
-      // #4998: a heading inside a fenced example is not a section. Detected
-      // with the locator the writers below and the readers use (#4998 review).
-      const headingScan = maskFencedLines(content, { document: true });
-      const existingCanonicalSession = collectSection(headingScan, isSessionHeading, { levelBounded: true }) !== null;
-      const existingSessionContinuity = collectSection(headingScan, isSessionContinuityHeading, { levelBounded: true }) !== null;
-
-      // Track whether the chosen branch's rewrite actually matched. The detector
-      // and the writer share one locator (CRLF-tolerant: the tokenizer strips
-      // a trailing \r). If the writer still fails to match (line-ending
-      // mismatch, unexpected heading shape, ...), do NOT report success — the
-      // caller would believe fields were persisted that were silently dropped
-      // (#2450). The append branch always sets rewriteMatched=true (it always
-      // mutates content).
-      let rewriteMatched = false;
-      // `created` means a session section was added, as in record-metric and
-      // add-decision — not a field inserted into an existing one (#4998 review).
-      let sectionAppended = false;
-
-      // #4998: insert each missing field into `region`,
-      // in the section's own spelling and in template order (Last session →
-      // Stopped at → Resume file), beside the sibling it follows — a bold
-      // `**Stopped at:**` above plain `Last session:` lines is a line the
-      // template does not define. With no sibling present it goes right after
-      // the heading in bold, the pre-#4998 shape. Every existing line is kept.
-      // A heading at EOF with no line terminator gets one first, so its body
-      // exists to insert into rather than a field being glued onto it.
-      // The section is located on the masked text (same offsets): a fenced
-      // `## Session` example is not the section, and a ``` in a frontmatter
-      // block scalar does not hide the real one (Codex review round 2).
-      const insertIntoSection = (isTarget: (h: HeadingToken) => boolean): void => {
-        let section = collectSection(maskFencedLines(content, { document: true }), isTarget, { levelBounded: true });
-        if (section && content[section.bodyStart - 1] !== '\n' && section.bodyStart >= content.length) {
-          content += content.includes('\r\n') ? '\r\n' : '\n';
-          section = collectSection(maskFencedLines(content, { document: true }), isTarget, { levelBounded: true });
-        }
-        if (!section || content[section.bodyStart - 1] !== '\n') return;
-        const body = insertMissingSessionFields(content.slice(section.bodyStart, section.bodyEnd), [
-          { label: 'Last session', needed: needsLastSession, value: now },
-          { label: 'Stopped at', needed: !!needsStoppedAt, value: stoppedAtValue },
-          { label: 'Resume file', needed: needsResumeFile, value: resumeValue },
-        ]);
-        content = replaceSection(content, section, body);
-        rewriteMatched = true;
-      };
-
-      if (existingCanonicalSession) {
-        // #4998: insert the missing fields in place. This used to replace the
-        // whole section with three canonical lines, which deleted any wrapped
-        // value or note in it — and reset an authored Resume file to None.
-        insertIntoSection(isSessionHeading);
-      } else if (existingSessionContinuity) {
-        // #1101: a `## Session Continuity` section already exists (bootstrap
-        // shape). Previously this fell through to the append branch and created
-        // a SECOND `## Session` block — a duplicate. Instead, insert only the
-        // canonical fields that are still missing (#4998: beside their siblings),
-        // preserving the `## Session Continuity` heading and ALL existing lines
-        // (e.g. prose like "Next recommended action"). Fields already updated in
-        // place above (needs* false) are not re-inserted. A function replacement
-        // is used so `$`-bearing caller values are inserted literally (#3454).
-        //
-        // Heading match is case-insensitive and CRLF-tolerant like the
-        // `existingSessionContinuity` detection above (#1101 review F3, #2450):
-        // a detected heading the writer then misses would report fields as
-        // updated that were never written (`rewriteMatched` stays false).
-        insertIntoSection(isSessionContinuityHeading);
-      } else {
-        // No session heading exists at all — append a new canonical section.
-        // #4998: the appended section becomes the one the sync reads, so a
-        // field this call is not setting carries the value the sync reads
-        // today (a body line, a wrapped field's first line, a table row)
-        // rather than None or nothing — which dropped the frontmatter
-        // `stopped_at` and reset an authored Resume file. Later writes then
-        // land on these bold lines first. A field skipped above as wrapped
-        // carries its existing value too — Last session included — so a
-        // skipped field never comes back carrying the new value.
-        // Read from the body, as the sync does — never from frontmatter, and
-        // never from a fenced example.
-        const syncBody = readableBoldLabels(maskFencedLines(stripFrontmatter(content)));
-        const carried = (fields: readonly string[], fallback: string): string => {
-          for (const field of fields) {
-            const value = stateExtractField(syncBody, field);
-            if (value !== null) return value;
-          }
-          return fallback;
-        };
-        const lastSessionValue = skipped('Last session') || skipped('Last Date')
-          ? carried(['Last session', 'Last Date'], now)
-          : now;
-        const scaffoldFields: [string, string][] = [
-          ['Last session', lastSessionValue],
-          ['Stopped at', needsStoppedAt ? stoppedAtValue : carried(['Stopped At'], stoppedAtValue)],
-          ['Resume file', needsResumeFile ? resumeValue : carried(['Resume File'], resumeValue)],
-        ];
-        // A document that ends inside an unclosed fence would swallow the
-        // appended section — nothing reads it there. Write nothing, and say so.
-        // The whole document is scanned on purpose: whether its tail is fenced
-        // depends on every delimiter before it (frontmatter excluded: YAML, not
-        // Markdown), and `scanFencedBlocks` reports
-        // an unclosed block only as its LAST record (the fence runs to EOF), so
-        // `closeLineIdx === -1` here means exactly "the tail is inside a fence".
-        if (markdownFencedBlocks(content.split('\n'), { document: true }).some((b) => b.closeLineIdx === -1)) {
-          // Named only for a field this call writes (Last session always, the
-          // others when passed) and not already written in place or skipped
-          // for another reason (Codex review; trek-e review 5608265301, Minor 3).
-          const fieldKey = (f: string): string => (f === 'Last Date' ? 'last session' : f.toLowerCase());
-          const requested = new Set(['last session']);
-          if (options.stopped_at) requested.add('stopped at');
-          if (options.resume_file !== undefined && options.resume_file !== null) requested.add('resume file');
-          const settled = new Set([...updated, ...skippedFields.map((s) => s.field)].map(fieldKey));
-          // A Stopped at already holding the value needs no write (Codex review).
-          if (stoppedAtMatched) settled.add('stopped at');
-          for (const [label] of scaffoldFields) {
-            const key = fieldKey(label);
-            if (requested.has(key) && !settled.has(key)) skippedFields.push({ field: label, reason: 'unclosed_fence' });
-          }
-        } else {
-          // A carried value holding a line separator (a hand-written table cell
-          // can) would forge a line once written as a bold field: leave that
-          // field out, and say so.
-          const scaffoldLines: string[] = [];
-          for (const [label, value] of scaffoldFields) {
-            if (FIELD_LINE_BREAK_RE.test(value)) skippedFields.push({ field: label, reason: 'line_separator' });
-            else scaffoldLines.push(`**${label}:** ${value}`);
-          }
-          const scaffold = ['', '## Session', '', ...scaffoldLines, ''].join('\n');
-          content = content.trimEnd() + '\n' + scaffold;
-          rewriteMatched = true;
-          sectionAppended = true;
-        }
-      }
-
-      // #2450 defensive invariant: only report sessionCreated/updated when the
-      // chosen branch's rewrite actually mutated content. Unreachable when the
-      // writer regexes above stay in sync with the CRLF-tolerant detector —
-      // but unreachable-defensive is the right posture for a silent-success
-      // gate. A no-op replace here means a future line-ending or shape drift
-      // between detector and writer; fail to record rather than claim success.
-      //
-      // Scope limitation (not a regression of this fix): the gate covers only
-      // the section-rewrite block. The earlier in-place stateReplaceField
-      // successes at :1081/:1083/:1089/:1101/:1108/:1114 push to `updated`
-      // unconditionally — those represent fields that DID land on disk via
-      // same-line replace (CRLF-agnostic seam), so unconditional push is
-      // correct. The class-defect防御 here is for the INSERT path only.
-      if (rewriteMatched) {
-        sessionCreated = sectionAppended;
-        if (needsLastSession) updated.push('Last session');
-        if (needsStoppedAt) updated.push('Stopped At');
-        if (needsResumeFile) updated.push('Resume File');
-      }
-    }
-
-    return content;
+    return applyRecordSessionTransform(content, options, now, updated, flags, { priorRecord, skippedFields, skipWrapped });
   }, cwd, { divergedFields, preWriteState });
+  const sessionCreated = flags.sessionCreated;
+
+  // Concurrent sessions: the STATE.md `## Session` block above is a shared,
+  // last-writer-wins slot. When this call can be attributed to a session,
+  // mirror the same fields into that session's own record so a later resume
+  // (or the statusline) can tell sessions apart. Absent a session id the
+  // output below is byte-identical to the pre-session-store behaviour.
+  const sessionExtras = writeSessionRecordForOptions(cwd, options, now);
 
   // ADR-3408 §8.4 (D4): reconcile this command's own success list against the
   // bytes actually persisted (fix(#3351) generalized) and fold in any field
@@ -2520,7 +2584,7 @@ function cmdStateRecordSession(cwd: string, options: StateRecordSessionOptions, 
         'code fence, which would swallow a new ## Session section. Close the fence, then re-run.'));
 
   if (reconciledUpdated.length > 0) {
-    const result: Record<string, unknown> = { recorded: true, updated: reconciledUpdated };
+    const result: Record<string, unknown> = { recorded: true, updated: reconciledUpdated, ...sessionExtras };
     if (sessionCreated) result['created'] = true;
     if (skippedRows.length > 0) {
       result['skipped'] = skippedRows;
@@ -2556,6 +2620,10 @@ function cmdStateRecordSession(cwd: string, options: StateRecordSessionOptions, 
     }
     if (Object.keys(replacedRecord).length > 0) result['replacedRecord'] = replacedRecord;
     output(result, raw, 'true');
+  } else if (sessionExtras) {
+    // STATE.md had nothing to change, but the per-session record was written
+    // — that IS a recorded heartbeat for this session, not a no-op.
+    output({ recorded: true, updated: [], ...sessionExtras }, raw, 'true');
   } else if (skippedRows.length > 0) {
     // #4998: every field the call would have changed wraps — nothing written.
     declineNoOp(
@@ -2591,6 +2659,194 @@ function cmdStateRecordSession(cwd: string, options: StateRecordSessionOptions, 
       'state record-session skipped — the matched session field(s) already held the reported value; no bytes changed.',
     );
   }
+}
+
+/**
+ * Shared tail of record-session / session-resume: persist the session-scoped
+ * record when a session id resolves. Returns the output fields to merge, or
+ * null when no session id is known (the legacy single-session shape).
+ */
+function writeSessionRecordForOptions(
+  cwd: string,
+  options: StateRecordSessionOptions,
+  now: string,
+): { session_id: string; session_record: string } | null {
+  const sid = sessionStore.resolveSessionId(options.session);
+  if (!sid) return null;
+  const patch: sessionStore.SessionRecordPatch = { last_session: now };
+  if (options.stopped_at) patch.stopped_at = options.stopped_at;
+  if (options.resume_file !== undefined && options.resume_file !== null) patch.resume_file = options.resume_file;
+  if (options.role !== undefined && options.role !== null && options.role.trim()) patch.role = options.role.trim();
+  const roleId = sessionStore.sanitizeRoleId(options.role_id);
+  if (roleId) patch.role_id = roleId;
+  sessionStore.upsertSessionRecord(cwd, sid, patch, now);
+  return { session_id: sid, session_record: toPosixPath(path.relative(cwd, sessionStore.sessionRecordPath(cwd, sid))) };
+}
+
+/**
+ * Validate an explicit `--handoff` path: it must resolve INSIDE the project's
+ * `.planning/` root and be named like a handoff. Returns the absolute path or
+ * exits through `error`.
+ */
+function resolveExplicitHandoffPath(cwd: string, handoff: string): string {
+  const planningRoot = path.resolve(cwd, '.planning');
+  const abs = path.resolve(cwd, handoff);
+  const rel = path.relative(planningRoot, abs);
+  const inside = rel !== '' && !rel.startsWith('..') && !path.isAbsolute(rel) && !rel.includes(path.sep) && !rel.includes('/');
+  if (!inside || !sessionStore.HANDOFF_FILENAME_RE.test(path.basename(abs))) {
+    error(`--handoff must name a HANDOFF*.json file at the .planning/ root: ${handoff}`);
+  }
+  return abs;
+}
+
+/**
+ * `state session-resume` — the "this session is no longer paused" verb.
+ *
+ * Pause is per session and is represented ONLY by the session's handoff file
+ * (`.planning/HANDOFF*.json`, see session-store.cts); the statusline draws
+ * `paused` from that file's presence. Deleting it therefore belongs to the
+ * verb that records "Session resumed" — if the workflow prose deleted it
+ * later, every step in between would still render as paused.
+ *
+ * Also repairs the legacy project-wide `status: paused`: a frontmatter
+ * `status: paused` with NO `Paused At:` line under `## Session` is the
+ * pre-per-session shape (`preserve-when-unchanged` kept it alive forever
+ * because nothing ever rewrote the body `Status:`). It is re-derived from
+ * the body `Status:` and, when that yields a real status, overwritten via
+ * the `authoritativeFm` seam (the only channel that survives
+ * `applyPreserveWhenUnchanged` — see cmdStateUpdate). A hand-written
+ * `Paused At:` line is an explicit pause and is left alone.
+ */
+function cmdStateSessionResume(cwd: string, options: StateSessionResumeOptions, raw: boolean): void {
+  const statePath = planningPaths(cwd).state;
+  if (!fs.existsSync(statePath)) { output({ error: 'STATE.md not found' }, raw, undefined); return; }
+
+  const sid = sessionStore.resolveSessionId(options.session);
+  const roleId = sessionStore.resolveRoleId(cwd, sid, options.role, options.role_id);
+  const self: sessionStore.SessionIdentity = { session_id: sid, role_id: roleId };
+  const explicitHandoff = options.handoff ? resolveExplicitHandoffPath(cwd, options.handoff) : null;
+
+  const action = (options.action ?? '').trim() || 'next action';
+  const stoppedAt = `Session resumed, proceeding to ${action}`;
+  const recordOptions: StateRecordSessionOptions = {
+    stopped_at: stoppedAt,
+    session: sid,
+    role: options.role,
+    role_id: options.role_id,
+  };
+
+  const now = realClock.nowIso();
+  const updated: string[] = [];
+  const divergedFields: string[] = [];
+  const preWriteState: StatePreWriteSnapshot = {};
+  const authoritativeFm: Record<string, unknown> = {};
+  const flags = { sessionCreated: false };
+  const status: { before: string | null; after: string | null; cleared: boolean; reason?: string } = {
+    before: null,
+    after: null,
+    cleared: false,
+  };
+
+  readModifyWriteStateMd(statePath, (content) => {
+    const fm = extractFrontmatter(content, statePath) as Record<string, unknown>;
+    const before = typeof fm['status'] === 'string' ? fm['status'] : null;
+    status.before = before;
+    status.after = before;
+    if (before === 'paused') {
+      const body = stripFrontmatter(content);
+      const sessionScope = matchSessionSection(body) ?? body;
+      const pausedAt = stateExtractField(sessionScope, 'Paused At');
+      if (pausedAt && pausedAt.trim()) {
+        status.reason = 'explicit Paused At line under ## Session — left as is';
+      } else {
+        const derived = normalizeStateStatus(stateExtractField(body, 'Status'), null);
+        if (derived === 'paused' || derived === 'unknown') {
+          status.reason = derived === 'unknown'
+            ? 'no body Status: line to re-derive from — left as is'
+            : 'body Status: is itself paused — left as is';
+        } else {
+          authoritativeFm['status'] = derived;
+          status.after = derived;
+          status.cleared = true;
+        }
+      }
+    }
+    return applyRecordSessionTransform(content, recordOptions, now, updated, flags, {
+      priorRecord: {},
+      skippedFields: [],
+      skipWrapped: () => false,
+    });
+  }, cwd, { divergedFields, preWriteState, authoritativeFm });
+
+  // Report what is actually on disk, not what the transform intended: the
+  // #948 no-op guard skips the write (and with it `authoritativeFm`) when the
+  // transform output is byte-identical to the input — only reachable when
+  // `now` already equals the recorded `Last session`, but a reported
+  // `cleared: true` over an unchanged file would be a lie.
+  if (status.cleared) {
+    try {
+      const persisted = extractFrontmatter(platformReadSync(statePath) || '', statePath) as Record<string, unknown>;
+      const onDisk = typeof persisted['status'] === 'string' ? persisted['status'] : null;
+      if (onDisk !== status.after) {
+        status.after = onDisk;
+        status.cleared = false;
+        status.reason = 'STATE.md write was a no-op this call (nothing else changed) — rerun to clear';
+      }
+    } catch {
+      /* unreadable after write — leave the transform's report */
+    }
+  }
+
+  const sessionExtras = writeSessionRecordForOptions(cwd, recordOptions, now);
+  const reconciledUpdated = reconcileReportedFields(statePath, preWriteState, updated, divergedFields);
+
+  // Consume this session's handoff(s). Best-effort: a locked file on Windows
+  // (EBUSY) must not fail the resume — the caller sees the path under
+  // `handoff_error` and the next resume retries.
+  const removed: string[] = [];
+  const errors: string[] = [];
+  if (!options.keep_handoff) {
+    const targets = explicitHandoff
+      ? [explicitHandoff]
+      : sessionStore.ownHandoffs(cwd, self).map((h) => h.path);
+    for (const target of targets) {
+      try {
+        fs.unlinkSync(target);
+        removed.push(toPosixPath(path.relative(cwd, target)));
+      } catch (e) {
+        const code = (e as NodeJS.ErrnoException).code;
+        if (code === 'ENOENT') continue;
+        errors.push(`${toPosixPath(path.relative(cwd, target))}: ${code ?? (e as Error).message}`);
+      }
+    }
+  }
+
+  const result: Record<string, unknown> = {
+    resumed: true,
+    session_id: sid,
+    role_id: roleId,
+    updated: reconciledUpdated,
+    ...(sessionExtras ?? {}),
+    status,
+    handoff_removed: removed,
+  };
+  if (errors.length > 0) result['handoff_error'] = errors;
+  output(result, raw, 'true');
+}
+
+/** `state sessions` — read-only view of every session's handoff / record. */
+function cmdStateSessions(cwd: string, options: StateSessionsOptions, raw: boolean): void {
+  const sid = sessionStore.resolveSessionId(options.session);
+  const roleId = sessionStore.resolveRoleId(cwd, sid, options.role, options.role_id);
+  const self: sessionStore.SessionIdentity = { session_id: sid, role_id: roleId };
+  const sessions = sessionStore.listSessions(cwd, self).map((view) => ({
+    ...view,
+    handoff_path: view.handoff_path ? toPosixPath(path.relative(cwd, view.handoff_path)) : null,
+    continue_here_path: view.continue_here_path ? toPosixPath(path.relative(cwd, view.continue_here_path)) : null,
+    record_path: view.record_path ? toPosixPath(path.relative(cwd, view.record_path)) : null,
+  }));
+  // Always JSON — like `state json`, the payload IS the answer; `--raw` has no scalar projection.
+  output({ self, paused: sessions.some((v) => v.is_self && v.paused), sessions }, raw, undefined);
 }
 
 /**
@@ -8331,6 +8587,8 @@ export = {
   cmdStateAddRoadmapEvolution,
   cmdStateResolveBlocker,
   cmdStateRecordSession,
+  cmdStateSessionResume,
+  cmdStateSessions,
   cmdStateSnapshot,
   cmdStateJson,
   cmdStateBeginPhase,

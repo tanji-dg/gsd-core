@@ -264,6 +264,8 @@ export default tseslint.config(
       'gsd-core/bin/lib/milestone-lock.cjs',
       // #5551: tsc-generated runtime artifact — lint src/git-info-exclude.cts, not this.
       'gsd-core/bin/lib/git-info-exclude.cjs',
+      // tsc-generated runtime artifact — lint src/session-store.cts, not this.
+      'gsd-core/bin/lib/session-store.cjs',
       'gsd-core/bin/lib/health-diagnostic-types.cjs',
       'gsd-core/bin/lib/health-diagnostic.cjs',
       'gsd-core/bin/lib/health-diagnostic-rules/root-existence.cjs',
