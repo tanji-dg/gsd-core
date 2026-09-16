@@ -90,6 +90,17 @@ shopt -s nullglob 2>/dev/null; setopt NULL_GLOB 2>/dev/null
 # belongs to that session, not to whoever runs this next.
 session_id="${CLAUDE_CODE_SESSION_ID:-}"
 find .planning -maxdepth 1 -name 'HANDOFF*.json' -print 2>/dev/null || true
+# Structured view of the same files (preferred when gsd-tools is available;
+# the `find` lines above and below stay as the no-gsd-tools fallback):
+#   sessions[].is_self            — this handoff / record belongs to THIS session
+#                                   (session id match, or role match via
+#                                   .planning/sessions/<session_id>.json)
+#   sessions[].role / role_id     — whose it is
+#   sessions[].handoff_path       — the HANDOFF*.json to read
+#   sessions[].continue_here_path — its .continue-here twin, already located
+#   paused                        — true iff one of the is_self entries has a handoff
+# Pass --role-id when the user already said which role to resume as.
+gsd_run state sessions ${session_id:+--session "$session_id"} --raw 2>/dev/null || true
 
 # Check for continue-here files (phase + non-phase + legacy fallback).
 # Use `find` rather than a chained `ls` of bare globs: under zsh's default
@@ -148,12 +159,12 @@ fi
 - Validate `uncommitted_files` against `git status` — flag divergence
 - Use `context_notes` to restore mental model
 - Flag: "Found structured handoff — resuming from task {task}/{total_tasks}" (append `, role: {role}` when a role was restored)
-- **After successful resumption, delete the HANDOFF file that was read** (it's a one-shot artifact) — delete only the file this session claimed/matched, not other sessions' `HANDOFF*.json`. For a role-keyed handoff, delete both the `claimed.*` JSON and the claimed `.continue-here.*` markdown, and commit the deletion so the working tree doesn't carry a stale `D` (the pause was a WIP commit, so the content stays recoverable from git history):
+- **The consumed HANDOFF JSON is deleted by `state session-resume` in the `update_session` step below** (it's a one-shot artifact, and its presence is what renders this session as `paused` — so the verb that records "Session resumed" is the one that removes it). It removes only this session's own file(s): the `claimed.<role_id>.<session_id>` JSON, a `HANDOFF.<session_id>.json`, or a legacy `HANDOFF.json` whose body names this session/role. To adopt another session's handoff pass `--handoff <path>`; to keep the file (inspection only) pass `--keep-handoff`. **Never delete other sessions' `HANDOFF*.json` by hand.** The claimed `.continue-here.*` markdown is still removed by you, alongside, and both deletions are committed (the pause was a WIP commit, so the content stays recoverable from git history):
   ```bash
-  git rm -q .planning/HANDOFF.claimed.${role_id}.${session_id}.json [claimed continue-here path]
-  gsd_run query commit "chore: [role] handoff consumed by ${session_id:0:8}" --files .planning/HANDOFF.claimed.${role_id}.${session_id}.json [claimed continue-here path]
+  git rm -q --ignore-unmatch [claimed continue-here path]
+  gsd_run query commit "chore: [role] handoff consumed by ${session_id:0:8}" --files-removed [handoff path reported in handoff_removed] [claimed continue-here path]
   ```
-  Delete only once the role has actually been restored (and registered, where the project has a registry) — the file's absence is what tells the next session that the role is taken.
+  Run `state session-resume` only once the role has actually been restored (and registered, where the project has a registry) — the file's absence is what tells the next session that the role is taken.
 
 **If .continue-here file exists (phase/non-phase/legacy fallback):**
 
@@ -336,19 +347,25 @@ Resume-specific exception: do **not** emit `/clear then:` here. Resume is alread
 </step>
 
 <step name="update_session">
-Before proceeding to routed workflow, update session continuity:
+Before proceeding to routed workflow, record the resumption for THIS session — through the verb, never by hand-editing STATE.md:
 
-Update STATE.md:
-
-```markdown
-## Session Continuity
-
-Last session: [now]
-Stopped at: Session resumed, proceeding to [action]
-Resume file: [updated if applicable]
+```bash
+gsd_run state session-resume \
+  ${session_id:+--session "$session_id"} \
+  ${role_id:+--role "[restored role verbatim]" --role-id "$role_id"} \
+  --action "[routed action, e.g. execute-phase 3]" \
+  [--handoff .planning/HANDOFF.<other>.json   # only when adopting another session's handoff] \
+  [--keep-handoff                             # only when NOT consuming the handoff]
 ```
 
-This ensures if session ends unexpectedly, next resume knows the state.
+What it does (so you don't do any of it by hand):
+- Records `Stopped at: Session resumed, proceeding to [action]` + `Last session` in STATE.md's `## Session` block **and** in this session's own record `.planning/sessions/<session_id>.json` (`session_record` in the output).
+- Repairs a legacy project-wide pause: a frontmatter `status: paused` with no explicit `Paused At:` line is re-derived from the body `Status:` (`status.cleared: true` in the output). An explicit `Paused At:` line is left alone.
+- Deletes the consumed handoff JSON (`handoff_removed` lists the paths; `handoff_error` if a file could not be removed — retry later, do not fall back to editing STATE.md).
+
+Rules: do **not** edit `## Session` / `## Session Continuity` by hand, do **not** write `status: paused`, and do **not** delete other sessions' `HANDOFF*.json`. If the installed gsd-tools rejects `session-resume` (older version), fall back to `state record-session --stopped-at "Session resumed, proceeding to [action]"` and delete only this session's handoff file yourself.
+
+This ensures if session ends unexpectedly, next resume knows the state — for this session, without disturbing the others.
 </step>
 
 </process>

@@ -2,6 +2,8 @@
 
 <purpose>
 Create structured `.planning/HANDOFF.json` and `.continue-here.md` handoff files to preserve complete work state across sessions. The JSON provides machine-readable state for `/gsd:resume-work`; the markdown provides human-readable context. Both filenames are keyed by the session's **role** when it has one (e.g. `HANDOFF.latest.design.json`) — the role is the identity that survives `/clear` and restarts, so the resuming session can find its own handoff and claim it. Sessions without a role fall back to a session-id key (`HANDOFF.<session_id>.json`) so concurrent sessions paused in the same directory still don't overwrite each other.
+
+**Pause is per session, not per project.** Several sessions (coordinator, hardware operator, design reviewer, …) may share one `.planning/`; the others keep working while this one pauses. A session's paused state is represented **solely by the existence of its handoff file** under `.planning/` — the statusline, `/gsd:next` and `/gsd:resume-work` all read it from there. **Never set STATE.md `status:` to `paused` and never add a `Paused At:` line** — that would flip every session's status and there is no GSD path back out of it. The shared `## Session` block still gets a heartbeat (`state record-session`) for backward compatibility, and the same fields are mirrored to this session's own record `.planning/sessions/<session_id>.json`.
 </purpose>
 
 <required_reading>
@@ -263,10 +265,32 @@ timestamp=$(gsd_run query current-timestamp full --raw)
 ```
 </step>
 
+<step name="record_session">
+**Record the pause as this session's continuity heartbeat** — through the verb, never by hand-editing STATE.md:
+
+```bash
+# --session keys the per-session record (.planning/sessions/<session_id>.json);
+# --role / --role-id carry this session's role so resume-work and the statusline
+# can match the role-keyed handoff back to it. Omit the role flags when the
+# session has no role. The STATE.md `## Session` block is updated as before.
+gsd_run state record-session \
+  --stopped-at "Paused: [context] [XX-name] task [X]/[Y] — [one-line what was in flight]" \
+  --resume-file "[handoff-path with ${continue_here_name}]" \
+  ${session_id:+--session "$session_id"} \
+  ${role_id:+--role "[role verbatim]" --role-id "$role_id"}
+```
+
+Rules:
+- **Never set STATE.md `status:` to `paused` or add a `Paused At:` line.** Pause is per-session — represented solely by `.planning/${handoff_json_name}`. Other sessions share this `.planning/` and keep working; a project-wide `paused` would be wrong for them and nothing clears it.
+- Do not edit `## Session` / `## Session Continuity` by hand; `state record-session` owns that block.
+- If `state record-session` rejects `--session` (older installed gsd-tools), rerun it without the session/role flags — the handoff files alone still carry the pause.
+</step>
+
 <step name="commit">
 ```bash
-gsd_run query commit "wip: [context-name] paused at [X]/[Y]" --files [handoff-path with ${continue_here_name}] .planning/${handoff_json_name}
+gsd_run query commit "wip: [context-name] paused at [X]/[Y]" --files [handoff-path with ${continue_here_name}] .planning/${handoff_json_name} ${session_id:+.planning/sessions/${session_id}.json}
 ```
+(`.planning/sessions/<session_id>.json` is included only when `state record-session` reported a `session_record`.)
 </step>
 
 <step name="confirm">
@@ -274,6 +298,7 @@ gsd_run query commit "wip: [context-name] paused at [X]/[Y]" --files [handoff-pa
 ✓ Handoff created:
   - .planning/${handoff_json_name} (structured, machine-readable, keyed to this session's role — or session id if no role)
   - [handoff-path with ${continue_here_name}] (human-readable, same key)
+  - .planning/sessions/${session_id}.json (this session's continuity record; STATE.md status left untouched — pause is per-session)
 
 Current state:
 
@@ -296,6 +321,7 @@ To resume: /gsd:resume-work
 - [ ] `role_id` derived (ASCII slug) when the session has a role, and the filenames keyed by it (`.continue-here.latest.<role_id>.md` / `HANDOFF.latest.<role_id>.json`); session-id key only when there is no role
 - [ ] `${continue_here_name}` created at correct path for detected context
 - [ ] `${handoff_json_name}` written to `.planning/`, including `session_id`, `role` and `role_id` (if applicable)
+- [ ] `state record-session` run with `--session` (and `--role`/`--role-id` when applicable); STATE.md `status:` NOT set to `paused`, no `Paused At:` line added
 - [ ] Required Reading, Anti-Patterns, and Infrastructure State sections filled
 - [ ] Pre-Execution Critique section filled if pausing between design and execution
 - [ ] Committed as WIP

@@ -509,5 +509,6 @@ export = {
   parseCliWorkstream,
   resolveActiveWorkstream,
   applyResolvedWorkstreamEnv,
+  sanitizeWorkstreamSessionToken,
   _resetControllingTtyCacheForTests,
 };
