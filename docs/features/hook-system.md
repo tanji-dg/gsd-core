@@ -16,6 +16,7 @@ group: Infrastructure Features
 - REQ-HOOK-07: Context usage MUST normalize for autocompact buffer (16.5% reserved, or the `CLAUDE_CODE_AUTO_COMPACT_WINDOW` share) — and MUST skip the buffer entirely when auto-compact is off (`autoCompactEnabled: false` in settings, or `DISABLE_AUTO_COMPACT` / `DISABLE_COMPACT`), so the bar shows the raw used%
 - REQ-HOOK-08: Update banner MUST be opt-in and silent unless an update is available (PR #2795)
 - REQ-HOOK-10: The Stop pause hook (autopause capability) MUST be inert unless `autopause.enabled`, MUST only request a pause above the configured used% (guarded by `autopause.guard_command`, once per 30 min, never on `stop_hook_active`), MUST hand only a handoff written for its own request to `autopause.clear_command` (detached), and MUST never clear a manual pause on its own
+- REQ-HOOK-11: With the autopause capability enabled the context monitor MUST emit one signal — its WARNING/CRITICAL text names the automatic pause threshold (`autopause.threshold_used_pct`, default 100 − critical) and tells the agent not to pause by hand — and `/gsd-pause-work` MUST arm the automatic resume itself (`--request-now`), `--keep-session` being the only way to stay paused
 - REQ-HOOK-09: The SessionStart(clear) resume hook MUST claim nothing unless a fresh pending record addressed to its own Claude Code process exists; on success it MUST route through `state session-resume` and commit only the two `.latest` deletions (`git commit --only`); it MUST never block the session (see `docs/session-resume-hook.md`)
 
 **Statusline Display:**

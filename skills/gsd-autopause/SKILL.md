@@ -53,6 +53,7 @@ threshold, but the session stays paused until you /clear and /gsd-resume-work by
 |----------|--------|
 | `status` (default) | Step 2a |
 | `request` | Step 2b |
+| `keep` | Step 2b with `--keep-session` (write the handoff, stay paused) |
 | `log` | Step 2c |
 | unknown | Show the usage message |
 
@@ -65,7 +66,8 @@ Usage: /gsd-autopause <mode>
 
 Modes:
   status    This session's autopause state, unclaimed handoffs, effective config
-  request   Put THIS session on the automatic path now (then run /gsd-pause-work)
+  request   Pause now and let the hooks clear + resume this session
+  keep      Pause now and STAY paused (no automatic /clear for 30 min)
   log       Tail the pause/resume hook logs
 ```
 
@@ -93,7 +95,7 @@ Run, from this session's own Bash (the hook identifies the session by
 `CLAUDE_CODE_SESSION_ID`):
 
 ```bash
-node "${CLAUDE_CONFIG_DIR:-$HOME/.claude}/hooks/gsd-pause-hook.js" --request-now
+node "${CLAUDE_CONFIG_DIR:-$HOME/.claude}/hooks/gsd-pause-hook.js" --request-now   # keep: --keep-session
 ```
 
 Then **immediately run the `gsd-pause-work` skill in this same turn** and finish through its WIP
@@ -112,9 +114,15 @@ Summarise: last request, last spawn, last resume, any line starting with `★`.
 
 ## What the operator needs to know
 
-- **A manual `/gsd-pause-work` is never cleared automatically.** Above the threshold the
-  next Stop re-requests a pause so the handoff is rewritten from *measured* state; below it
-  the session stays paused. Use `request` to put a manual pause on the automatic path.
+- **Every pause resumes automatically** while autopause is enabled — `/gsd-pause-work` arms
+  the cycle itself at its start, so a hand-run pause is cleared and resumed exactly like a
+  hook-requested one. To stay paused, say so: `/gsd-pause-work --keep-session` (30 min).
+  A handoff written by an older pause-work without the arming step is treated as manual:
+  above the threshold the next Stop re-requests so it is rewritten from *measured* state;
+  below it the session stays paused — `request` puts it on the automatic path.
+- **The context monitor knows.** Its CONTEXT WARNING / CRITICAL text says the automatic pause
+  will run at the threshold and asks the agent to finish the current step instead of running
+  `/gsd-pause-work` early; the threshold defaults to `100 − hooks.context_critical_threshold`.
 - **If the resume hook stops** (another session claimed the role first, the rename failed,
   `state session-resume` failed), the `.latest.*` files are still there — the fresh session
   gets a one-line listing and `/gsd-resume-work` picks up by hand.

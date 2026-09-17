@@ -72,6 +72,21 @@ deliberation=$(ls .planning/deliberations/*.md 2>/dev/null | head -1 || true)
 If phase is detected, proceed with phase handoff path. Otherwise use the first matching non-phase path above.
 </step>
 
+<step name="autopause_arm">
+**Arm the automatic resume (autopause capability).** When `.planning/config.json` has `autopause.enabled: true`, a pause is one operation: write the handoff, commit, and the Stop after the commit clears this session and resumes it in a fresh one with the handoff injected (`hooks/gsd-pause-hook.js` → `autopause.clear_command` → `hooks/gsd-resume-hook.js`). Whoever started the pause — the hook at the threshold, the user, or you — the freshest handoff is the one written right before the clear, so the default is always the automatic path. Run this BEFORE writing anything (the request timestamp must precede the handoff's):
+
+```bash
+# --keep-session only when the user asked to stay paused (/gsd-pause-work --keep-session):
+# the committed handoff is then left for a manual /clear + /gsd-resume-work.
+pause_hook="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/hooks/gsd-pause-hook.js"
+if [ -f "$pause_hook" ]; then
+  if echo "$ARGUMENTS" | grep -q -- '--keep-session'; then node "$pause_hook" --keep-session; else node "$pause_hook" --request-now; fi
+fi
+```
+
+It prints one line (no-op when autopause is disabled, idempotent when the hook already requested this pause). Never write the state file by hand.
+</step>
+
 <step name="gather">
 **Collect complete state for handoff:**
 
@@ -342,7 +357,7 @@ Current state:
 - Skills: [created/updated <name> | no change]
 - Notify: [sent: <one line> | not sent]
 
-To resume: /gsd:resume-work
+To resume: /gsd:resume-work   (autopause enabled: the next Stop clears and resumes this session automatically — unless --keep-session)
 
 ```
 </step>
@@ -361,5 +376,6 @@ To resume: /gsd:resume-work
 - [ ] skills step done (created/updated, or `skills: no change` written in the handoff)
 - [ ] notify step done (sent only if the user must act, and only via `autopause.notify_command`; recorded either way)
 - [ ] No blocking question was asked of the user (unknowns written as `unknown`)
+- [ ] autopause armed at the start (`gsd-pause-hook.js --request-now`, or `--keep-session` when asked to stay paused) — never by writing the state file by hand
 - [ ] User knows location and how to resume
 </success_criteria>

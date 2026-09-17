@@ -1,7 +1,7 @@
 ---
 name: gsd:pause-work
 description: Create context handoff when pausing work mid-phase
-argument-hint: "[--report]"
+argument-hint: "[--report] [--keep-session]"
 allowed-tools:
   - Read
   - Write
@@ -11,7 +11,7 @@ requires: [phase, progress]
 ---
 
 <objective>
-Create `.continue-here.md` handoff file to preserve complete work state across sessions. Filenames are keyed per session (`HANDOFF.latest.<role_id>.json` / `HANDOFF.<session_id>.json`) and the pause is recorded per session (`.planning/sessions/<session_id>.json`) — STATE.md `status:` is never set to `paused`, so concurrent sessions sharing one `.planning/` keep working.
+Create `.continue-here.md` handoff file to preserve complete work state across sessions. With the `autopause` capability enabled the pause is one operation — the committed handoff is cleared and resumed automatically; pass `--keep-session` to stay paused instead. Filenames are keyed per session (`HANDOFF.latest.<role_id>.json` / `HANDOFF.<session_id>.json`) and the pause is recorded per session (`.planning/sessions/<session_id>.json`) — STATE.md `status:` is never set to `paused`, so concurrent sessions sharing one `.planning/` keep working.
 
 Routes to the pause-work workflow which handles:
 - Current phase detection from recent files
