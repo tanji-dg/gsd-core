@@ -35,9 +35,12 @@ watcher                                  gsd-resume-hook.js (SessionStart, sourc
                                          6b. autopause.context_command → "### Project context" (≤ 4 KB)
                                          7. gsd-tools state session-resume --session --role --role-id
                                             --handoff <claimed json>  (JSON output; exit 0 ∧ resumed:true)
-                                         8. git commit --only  — the two .latest deletions only
-                                         9. additionalContext: handoff markdown (≤ 8 KB, else
-                                            truncated + `git show` pointer) + STATE.md excerpt
+                                         8. consume: commit_docs on ∧ both files tracked+clean →
+                                            git commit --only (the two .latest deletions);
+                                            otherwise remove the files, no git call
+                                         9. additionalContext: handoff markdown — full text (≤ 32 KB)
+                                            unless git holds it (then ≤ 8 KB + `git show` pointer);
+                                            over 32 KB the claimed MD stays on disk to Read — + STATE.md excerpt
                                             + "start from <next_action>, do not run /gsd-resume-work"
 10. sees <resumed file>            ◄───  10. writes resumed.json next to the pending file
 ```
@@ -118,8 +121,10 @@ otherwise                       → nothing
 - The block reason tells the session to run `gsd-pause-work` through the WIP
   commit, ask nothing (unknown → `unknown`) and **measure** state rather than
   recall it.
-- (b) accepts a `HANDOFF.latest.<role_id>.json` with `session_id` == ours, committed
-  (`git diff --quiet HEAD`), whose timestamp is **newer than this session** —
+- (b) accepts a `HANDOFF.latest.<role_id>.json` with `session_id` == ours whose
+  `.continue-here.latest.<role_id>.md` twin exists and is non-empty, both files
+  settled (unchanged for 10 s — a Stop that arrives earlier waits out the rest, so an
+  idle session's only Stop is not missed), and whose timestamp is **newer than this session** —
   `max(<config>/sessions/<pid>.json.startedAt, state.spawned_at, state.resumed_at)`,
   the last written by the resume hook. Whether the hook requested the pause or
   the user ran `/gsd-pause-work` by hand makes no difference: **a pause
@@ -128,7 +133,12 @@ otherwise                       → nothing
   already spawned for, from clearing us. Only `keep-session` (30 min) opts out.
   When neither `startedAt` nor `resumed_at` is known the hook falls back to the
   stricter requested-pause rule (timestamp ≥ `requested_at − 60 s`) — it never
-  guesses.
+  guesses. **git is not consulted** — a WIP commit is GSD's default (`commit_docs`),
+  not this capability's contract; a pause whose commit failed, a project with
+  `commit_docs: false`, or one without git hands over the same way (the log notes
+  whether the files happened to be committed). A half-written pair (JSON without its
+  twin, still changing) is logged as "handoff in progress"; a requested pause with no
+  complete handoff after 10 min is reported once through `autopause.notify_command`.
 - `node gsd-pause-hook.js --request-now` (from the session's own Bash;
   `CLAUDE_CODE_SESSION_ID`) writes `pause-requested` (`manual: true`) unless a
   live request exists; `--keep-session` writes `keep-session`. Both are no-ops

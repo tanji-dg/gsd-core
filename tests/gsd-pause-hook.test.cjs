@@ -23,6 +23,7 @@ const { cleanup, waitFor } = require('./helpers.cjs');
 const { PROBE_TIMEOUT_MS } = require('./helpers/timeouts.cjs');
 const { runHook: runHookSeam } = require('./helpers/process-seam.cjs');
 const { gitOrThrow } = require('./helpers/git-fixture.cjs');
+const { splitLines } = require('../gsd-core/bin/lib/text-lines.cjs');
 const hook = require('../hooks/gsd-pause-hook.js');
 const { MANAGED_HOOKS } = require('../hooks/managed-hooks-registry.cjs');
 
@@ -67,8 +68,12 @@ describe('pure pieces', () => {
   test('decide: the (a)/(b) matrix', () => {
     const base = { stopHookActive: false, state: {}, handoff: null, used: 70, threshold: 65, nowMs: NOW };
     const requested = { phase: 'pause-requested', requested_at: iso(-120000) };
-    const fresh = { file: 'HANDOFF.latest.coordinator.json', json: { timestamp: iso(-60000) } };
-    const old = { file: 'HANDOFF.latest.coordinator.json', json: { timestamp: iso(-3600000) } };
+    const fresh = { file: 'HANDOFF.latest.coordinator.json', complete: true, json: { timestamp: iso(-60000) } };
+    const old = { file: 'HANDOFF.latest.coordinator.json', complete: true, json: { timestamp: iso(-3600000) } };
+    // an incomplete (still being written) handoff never clears, and is reported as in progress
+    const partial = { file: 'HANDOFF.latest.coordinator.json', complete: false, reason: 'markdown twin is empty', json: { timestamp: iso(-1000) } };
+    assert.match(hook.decide({ ...base, state: requested, handoff: partial }).reason, /handoff in progress \(HANDOFF\.latest\.coordinator\.json: markdown twin is empty\)/);
+    assert.match(hook.decide({ ...base, handoff: partial, floorMs: NOW - 60000 }).reason, /handoff in progress/);
 
     assert.deepEqual(hook.decide(base), { kind: 'request', used: 70, threshold: 65 });
     assert.equal(hook.decide({ ...base, used: 64 }).kind, 'none');
@@ -104,7 +109,7 @@ describe('pure pieces', () => {
 
   test("decide (b'): a committed handoff newer than the session clears without a request; older never; keep-session opts out; not twice", () => {
     const base = { stopHookActive: false, state: {}, handoff: null, used: 30, threshold: 75, nowMs: NOW };
-    const fresh = { file: 'HANDOFF.latest.coordinator.json', json: { timestamp: iso(-1000) } };
+    const fresh = { file: 'HANDOFF.latest.coordinator.json', complete: true, json: { timestamp: iso(-1000) } };
     const floor = NOW - 60000;
     assert.equal(hook.decide({ ...base, handoff: fresh, floorMs: floor }).kind, 'spawn-clear', 'manual pause, no request');
     assert.equal(hook.decide({ ...base, handoff: fresh, floorMs: floor, stopHookActive: true }).kind, 'spawn-clear');
@@ -211,7 +216,8 @@ describe('end to end (scratch git project)', () => {
   }
 
   function run(dir, cfg, input, args = [], extraEnv = {}) {
-    const env = { ...process.env, CLAUDE_CONFIG_DIR: cfg };
+    // Settle window: 10 s in production; 1 s here unless a test overrides it.
+    const env = { ...process.env, CLAUDE_CONFIG_DIR: cfg, GSD_AUTOPAUSE_SETTLE_MS: '1000' };
     delete env.CLAUDE_CODE_SESSION_ID;
     Object.assign(env, extraEnv);
     const r = runHookSeam(HOOK_PATH, args, { input: input === undefined ? '' : JSON.stringify({ cwd: dir, ...input }), env, timeoutMs: HOOK_TIMEOUT_MS, cwd: dir });
@@ -334,7 +340,7 @@ describe('end to end (scratch git project)', () => {
     assert.equal(r.exitCode, 0, r.stderr);
     assert.equal(r.stdout.trim(), '');
     assert.equal(readState(dir).phase, 'clear-spawned');
-    assert.match(readLog(dir), /newer than session floor .*, not requested\) → spawned/);
+    assert.match(readLog(dir), /newer than session floor .*, not requested, committed: yes\) → spawned/);
     await waitFor(() => fs.existsSync(marker), { timeoutMs: PROBE_TIMEOUT_MS, message: 'clear_command did not run' });
     assert.equal(fs.readFileSync(marker, 'utf8'), 'SID');
     // the same handoff never clears twice: spawned_at is now the floor
@@ -366,17 +372,107 @@ describe('end to end (scratch git project)', () => {
     assert.ok(!fs.existsSync(marker));
   });
 
-  test('(b) uncommitted handoff is not "done"; handoff older than the request is not "done"', (t) => {
+  function writeHandoffPair(dir, sid, roleId, timestamp, opts = {}) {
+    const json = path.join(dir, '.planning', `HANDOFF.latest.${roleId}.json`);
+    const md = path.join(dir, '.planning', 'phases', '02-x', `.continue-here.latest.${roleId}.md`);
+    fs.writeFileSync(json, JSON.stringify({ session_id: sid, role: 'coordinator', role_id: roleId, timestamp, phase_dir: '.planning/phases/02-x' }));
+    if (!opts.noMd) fs.writeFileSync(md, opts.mdText === undefined ? '# h' : opts.mdText);
+    if (opts.settled) {
+      const old = new Date(Date.now() - 60000);
+      fs.utimesSync(json, old, old);
+      if (!opts.noMd) fs.utimesSync(md, old, old);
+    }
+    return { json, md };
+  }
+
+  test("(b'') an UNTRACKED (never committed) handoff pair clears — git is not consulted", async (t) => {
+    const { marker, cmd } = clearMarker(t, 'gsd-pause-hook-untracked');
+    const { dir, cfg } = makeProject(t, { autopause: { clear_command: cmd } });
+    fs.writeFileSync(path.join(cfg, 'sessions', '4242.json'), JSON.stringify({ sessionId: 'SID', name: 'x', startedAt: Date.now() - 600000 }));
+    const ctx = writeCtx('SID', 30);
+    t.after(() => { try { fs.unlinkSync(ctx); } catch { /* gone */ } });
+    writeHandoffPair(dir, 'SID', 'coordinator', new Date().toISOString(), { settled: true });
+    assert.match(gitOrThrow(['status', '--porcelain'], { cwd: dir }), /\?\? \.planning\/HANDOFF\.latest\.coordinator\.json/, 'precondition: untracked');
+    const r = run(dir, cfg, { session_id: 'SID', stop_hook_active: false });
+    assert.equal(r.exitCode, 0, r.stderr);
+    assert.equal(readState(dir).phase, 'clear-spawned');
+    assert.match(readLog(dir), /committed: no\) → spawned/);
+    await waitFor(() => fs.existsSync(marker), { timeoutMs: PROBE_TIMEOUT_MS, message: 'clear_command did not run' });
+  });
+
+  test("(b'') JSON without its markdown twin → 'handoff in progress', nothing spawned", (t) => {
+    const { marker, cmd } = clearMarker(t, 'gsd-pause-hook-nomd');
+    const { dir, cfg } = makeProject(t, { autopause: { clear_command: cmd } });
+    fs.writeFileSync(path.join(cfg, 'sessions', '4242.json'), JSON.stringify({ sessionId: 'SID', name: 'x', startedAt: Date.now() - 600000 }));
+    const ctx = writeCtx('SID', 30);
+    t.after(() => { try { fs.unlinkSync(ctx); } catch { /* gone */ } });
+    writeHandoffPair(dir, 'SID', 'coordinator', new Date().toISOString(), { settled: true, noMd: true });
+    const r = run(dir, cfg, { session_id: 'SID', stop_hook_active: false });
+    assert.equal(r.stdout.trim(), '');
+    assert.ok(!fs.existsSync(statePath(dir)));
+    assert.match(readLog(dir), /handoff in progress \(HANDOFF\.latest\.coordinator\.json: \.continue-here\.latest\.coordinator\.md not written yet\)/);
+    assert.ok(!fs.existsSync(marker));
+    // an empty twin is not written either
+    writeHandoffPair(dir, 'SID', 'coordinator', new Date().toISOString(), { settled: true, mdText: '' });
+    run(dir, cfg, { session_id: 'SID', stop_hook_active: false });
+    assert.match(readLog(dir), /markdown twin is empty/);
+    assert.ok(!fs.existsSync(marker));
+  });
+
+  test("(b'') a pair still being written waits out the settle window inside the Stop, then clears", async (t) => {
+    const { marker, cmd } = clearMarker(t, 'gsd-pause-hook-settle');
+    const { dir, cfg } = makeProject(t, { autopause: { clear_command: cmd } });
+    fs.writeFileSync(path.join(cfg, 'sessions', '4242.json'), JSON.stringify({ sessionId: 'SID', name: 'x', startedAt: Date.now() - 600000 }));
+    const ctx = writeCtx('SID', 30);
+    t.after(() => { try { fs.unlinkSync(ctx); } catch { /* gone */ } });
+    writeHandoffPair(dir, 'SID', 'coordinator', new Date().toISOString()); // fresh mtimes
+    const started = Date.now();
+    const r = run(dir, cfg, { session_id: 'SID', stop_hook_active: false }, [], { GSD_AUTOPAUSE_SETTLE_MS: '2000' });
+    assert.equal(r.exitCode, 0, r.stderr);
+    assert.ok(Date.now() - started >= 1500, 'the hook waited for the files to settle');
+    assert.match(readLog(dir), /waited for the handoff to settle → complete/);
+    assert.equal(readState(dir).phase, 'clear-spawned');
+    await waitFor(() => fs.existsSync(marker), { timeoutMs: PROBE_TIMEOUT_MS, message: 'clear_command did not run' });
+  });
+
+  test('a requested pause with no complete handoff after 10 min is reported once via autopause.notify_command', (t) => {
+    const marker = path.join(os.tmpdir(), `gsd-pause-hook-notify-${process.pid}-${Date.now()}.txt`);
+    t.after(() => { try { fs.unlinkSync(marker); } catch { /* gone */ } });
+    const script = `${marker}.cjs`;
+    t.after(() => { try { fs.unlinkSync(script); } catch { /* gone */ } });
+    fs.writeFileSync(script, `require('fs').appendFileSync(${JSON.stringify(marker)}, process.env.GSD_PAUSE_MESSAGE + '|' + process.argv[2] + '\\n');\n`);
+    const { dir, cfg } = makeProject(t, { autopause: { notify_command: `${JSON.stringify(process.execPath)} ${JSON.stringify(script)}` } });
+    const ctx = writeCtx('SID', 30);
+    t.after(() => { try { fs.unlinkSync(ctx); } catch { /* gone */ } });
+    fs.mkdirSync(path.dirname(statePath(dir)), { recursive: true });
+    fs.writeFileSync(statePath(dir), JSON.stringify({ phase: 'pause-requested', requested_at: new Date(Date.now() - 11 * 60000).toISOString(), used: 80, threshold: 75 }));
+    // half-written handoff on disk (JSON only)
+    writeHandoffPair(dir, 'SID', 'coordinator', new Date().toISOString(), { settled: true, noMd: true });
+    run(dir, cfg, { session_id: 'SID', stop_hook_active: false });
+    const lines = splitLines(fs.readFileSync(marker, 'utf8').trim());
+    assert.equal(lines.length, 1);
+    assert.match(lines[0], /^⏸ autopause \[SID\]: pause requested at .* but no complete handoff after 1[01] min — check the session\|⏸ autopause/);
+    assert.ok(readState(dir).notified_at, 'notified_at recorded');
+    run(dir, cfg, { session_id: 'SID', stop_hook_active: false });
+    assert.equal(splitLines(fs.readFileSync(marker, 'utf8').trim()).length, 1, 'reported once');
+    // fresh request (< 10 min) → no report
+    fs.writeFileSync(statePath(dir), JSON.stringify({ phase: 'pause-requested', requested_at: new Date().toISOString() }));
+    run(dir, cfg, { session_id: 'SID', stop_hook_active: false });
+    assert.equal(splitLines(fs.readFileSync(marker, 'utf8').trim()).length, 1);
+  });
+
+  test('(b) half-written handoff is not "done"; handoff older than the request is not "done"', (t) => {
     const { dir, cfg } = makeProject(t, { autopause: { clear_command: 'echo never' } });
     const ctx = writeCtx('SID', 10);
     t.after(() => { try { fs.unlinkSync(ctx); } catch { /* gone */ } });
     fs.mkdirSync(path.dirname(statePath(dir)), { recursive: true });
     const requestedAt = new Date(Date.now() - 120000).toISOString();
     fs.writeFileSync(statePath(dir), JSON.stringify({ phase: 'pause-requested', requested_at: requestedAt, used: 70, threshold: 65 }));
-    // written but not committed
+    // JSON written, markdown twin not yet → in progress, not done (commit is irrelevant)
     fs.writeFileSync(path.join(dir, '.planning', 'HANDOFF.latest.coordinator.json'), JSON.stringify({ session_id: 'SID', role_id: 'coordinator', timestamp: new Date().toISOString() }));
     run(dir, cfg, { session_id: 'SID', stop_hook_active: true });
     assert.equal(readState(dir).phase, 'pause-requested');
+    assert.match(readLog(dir), /handoff in progress/);
     // committed but older than the request (a leftover manual pause)
     commitHandoff(dir, 'SID', 'coordinator', new Date(Date.now() - 3600000).toISOString());
     run(dir, cfg, { session_id: 'SID', stop_hook_active: true });

@@ -14,21 +14,29 @@
 //       → record `pause-requested` in the state file and answer
 //         {"decision":"block","reason":"…"} so THIS session runs
 //         /gsd-pause-work now (unattended: no questions, measured state).
-//   (b) OUR pause is committed — a HANDOFF.latest.<role_id>.json with
-//       session_id == ours, committed (git clean), and NEWER than this session
+//   (b) OUR pause is WRITTEN — a HANDOFF.latest.<role_id>.json with
+//       session_id == ours, its .continue-here.latest.<role_id>.md twin present
+//       and non-empty, both files settled (mtime ≥ 10 s old — the hook waits
+//       out the remainder inside the Stop rather than miss the only Stop of an
+//       idle session), and the JSON timestamp NEWER than this session
 //       (timestamp > max(<config>/sessions/<pid>.json.startedAt, state.spawned_at,
 //       state.resumed_at)) → spawn `autopause.clear_command` DETACHED (stdio
 //       ignore, unref) and record `clear-spawned`. The command is the project's
 //       way of typing /clear into this session (tmux send-keys, …) — GSD ships
-//       no such thing. Whether the pause was hook-requested or hand-run does
-//       not matter: a pause committed in this session IS the decision to hand
-//       over (the arm step in pause-work.md is a courtesy, not a precondition —
-//       a model that re-runs an older procedure from memory must not silently
-//       strand the session). The lower bound is what keeps an older handoff
-//       (a previous session's, or one already spawned for) from clearing us.
-//       Only `keep-session` (30 min) opts out. When NEITHER startedAt nor
-//       resumed_at is known the hook falls back to the stricter "requested
-//       pause" rule (timestamp ≥ requested_at − 60 s) rather than guessing.
+//       no such thing. git is NOT consulted: pause-work's WIP commit is GSD's
+//       default behaviour, not this capability's contract — a pause whose
+//       commit failed, or a project without git, hands over exactly the same
+//       (the log notes whether the files happen to be committed). Whether the
+//       pause was hook-requested or hand-run does not matter either: a handoff
+//       written in this session IS the decision to hand over (the arm step in
+//       pause-work.md is a courtesy, not a precondition). The lower bound is
+//       what keeps an older handoff (a previous session's, or one already
+//       spawned for) from clearing us. Only `keep-session` (30 min) opts out.
+//       When NEITHER startedAt nor resumed_at is known the hook falls back to
+//       the stricter "requested pause" rule (timestamp ≥ requested_at − 60 s).
+//       A half-written handoff (JSON without its MD, or still changing) is
+//       logged as "handoff in progress"; a request that has not completed
+//       after 10 min is reported once through autopause.notify_command.
 //       No clear_command → logged ("set autopause.clear_command …"), the manual
 //       /clear → /gsd-resume-work path applies.
 //   (c) `--request-now` (CLI, no stdin; CLAUDE_CODE_SESSION_ID): arm the
@@ -62,7 +70,7 @@ const os = require('os');
 const path = require('path');
 const { spawn, spawnSync } = require('child_process');
 const { HOOK_ON_CRASH, allow, crash } = require('./lib/hook-exit.js');
-const { resolvePendingPath, readAutopauseConfig } = require('./gsd-resume-hook.js');
+const { resolvePendingPath, readAutopauseConfig, commitDocsEnabled } = require('./gsd-resume-hook.js');
 
 const ON_CRASH = HOOK_ON_CRASH.ALLOW;
 
@@ -70,6 +78,13 @@ const REQUEST_TTL_MS = 30 * 60 * 1000;
 const HANDOFF_SLACK_MS = 60 * 1000;
 const DEFAULT_THRESHOLD_USED_PCT = 75;
 const GUARD_TIMEOUT_MS = 30000;
+// A handoff counts as written once neither file has changed for this long;
+// a Stop that arrives earlier waits out the remainder (bounded by SETTLE_MS).
+const SETTLE_MS = (Number(process.env.GSD_AUTOPAUSE_SETTLE_MS) > 0) ? Number(process.env.GSD_AUTOPAUSE_SETTLE_MS) : 10000; // env: test seam only
+// A requested pause that has produced no complete handoff after this long is
+// reported once through autopause.notify_command (the TTL stays 30 min).
+const STALL_NOTIFY_MS = 10 * 60 * 1000;
+const NOTIFY_TIMEOUT_MS = 20000;
 
 // ---------------------------------------------------------------------------
 // helpers
@@ -159,6 +174,10 @@ function isHandoffToClear(handoffJson, state, floorMs, nowMs) {
  */
 function decide({ stopHookActive, state, handoff, used, threshold, nowMs, floorMs = null }) {
   const requested = isRequested(state, nowMs);
+  if (handoff && !handoff.complete) {
+    if (isHandoffToClear(handoff.json, state, floorMs, nowMs) || requested) return { kind: 'none', reason: `handoff in progress (${handoff.file}: ${handoff.reason})` };
+    handoff = null; // an older, incomplete leftover: ignore it below
+  }
   if (handoff && isHandoffToClear(handoff.json, state, floorMs, nowMs)) {
     if (requested && state.phase === 'keep-session') return { kind: 'none', reason: `keep-session (${handoff.file}) — staying paused by request` };
     if (floorMs === null && state.phase === 'clear-spawned') return { kind: 'none', reason: 'clear already spawned' };
@@ -221,26 +240,88 @@ function sessionFloorMs(session, state) {
   return cands.length ? Math.max(...cands) : null;
 }
 
-function gitClean(root, rel) {
+/**
+ * Is `rel` tracked AND unmodified in git? 'yes' | 'no' | 'no-git'. Informational
+ * only — the completion rule never depends on it — and never run without a
+ * repository (a project without git must behave identically).
+ */
+function gitState(root, rel, config) {
+  if (!commitDocsEnabled(root, config)) return 'n/a (commit_docs off)';
   const a = spawnSync('git', ['-C', root, 'diff', '--quiet', 'HEAD', '--', rel], { stdio: 'ignore', timeout: 15000 });
   const b = spawnSync('git', ['-C', root, 'ls-files', '--error-unmatch', '--', rel], { stdio: 'ignore', timeout: 15000 });
-  return a.status === 0 && b.status === 0;
+  return a.status === 0 && b.status === 0 ? 'yes' : 'no';
 }
 
-/** Our own committed HANDOFF.latest.<role_id>.json, or null. */
-function committedHandoffFor(root, sid) {
+function mtimeMs(p) {
+  try { return fs.statSync(p).mtimeMs; } catch (e) { return null; }
+}
+
+/**
+ * Assess our own HANDOFF.latest.<role_id>.json (session_id == sid) without
+ * git: complete when the JSON parses, the .continue-here twin exists and is
+ * non-empty, and neither file has changed for SETTLE_MS. Returns null when
+ * we have no handoff at all; otherwise
+ *   { file, rel, role_id, json, mdPath, complete, reason, settleWaitMs }
+ * where settleWaitMs > 0 means "complete once this much time has passed
+ * without a change" (the caller waits, then re-assesses).
+ */
+function assessHandoff(root, sid, nowMs) {
   const planning = path.join(root, '.planning');
   let names = [];
   try { names = fs.readdirSync(planning); } catch (e) { return null; }
   for (const n of names.sort()) {
     const m = /^HANDOFF\.latest\.([a-z0-9-]+)\.json$/.exec(n);
     if (!m) continue;
-    const json = readJson(path.join(planning, n));
-    if (!json || json.session_id !== sid) continue;
-    const rel = `.planning/${n}`;
-    if (gitClean(root, rel)) return { file: n, rel, role_id: m[1], json };
+    const jsonPath = path.join(planning, n);
+    let rawText = null;
+    try { rawText = fs.readFileSync(jsonPath, 'utf8'); } catch (e) { continue; }
+    let json = null;
+    try { json = JSON.parse(rawText); } catch (e) { json = null; }
+    // A JSON that does not parse yet may be ours mid-write: only claim it as
+    // ours when the session id is visible in the raw text.
+    const ours = json ? json.session_id === sid : (sid && rawText.indexOf(sid) !== -1);
+    if (!ours) continue;
+    const base = { file: n, rel: `.planning/${n}`, role_id: m[1], json: json || {}, mdPath: null, complete: false, reason: '', settleWaitMs: 0 };
+    if (!json) return Object.assign(base, { reason: 'JSON not parseable yet' });
+    const md = findLatestContinueHere(root, m[1], typeof json.phase_dir === 'string' ? json.phase_dir : null);
+    if (!md) return Object.assign(base, { reason: `.continue-here.latest.${m[1]}.md not written yet` });
+    base.mdPath = md;
+    let mdSize = 0;
+    try { mdSize = fs.statSync(md).size; } catch (e) { mdSize = 0; }
+    if (mdSize === 0) return Object.assign(base, { reason: 'markdown twin is empty' });
+    const newest = Math.max(mtimeMs(jsonPath) || 0, mtimeMs(md) || 0);
+    const age = nowMs - newest;
+    if (age < SETTLE_MS) return Object.assign(base, { reason: `still being written (last change ${Math.round(age / 1000)} s ago)`, settleWaitMs: SETTLE_MS - age });
+    return Object.assign(base, { complete: true });
   }
   return null;
+}
+
+/** assessHandoff, waiting out an in-flight settle window inside this Stop. */
+function handoffFor(root, sid, log) {
+  let h = assessHandoff(root, sid, Date.now());
+  if (h && !h.complete && h.settleWaitMs > 0) {
+    // The only Stop of an idle session may be this one; a few seconds of
+    // waiting is cheaper than stranding the session until its next turn.
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, Math.min(SETTLE_MS, Math.ceil(h.settleWaitMs) + 250));
+    h = assessHandoff(root, sid, Date.now());
+    if (log) log(`${sid8(sid)} waited for the handoff to settle → ${h && h.complete ? 'complete' : (h ? h.reason : 'gone')}`);
+  }
+  return h;
+}
+
+function notifyStall(root, autopause, sid, state, sp, log) {
+  if (!state || state.phase !== 'pause-requested' || state.notified_at) return;
+  const requestedAt = Date.parse(state.requested_at || '');
+  if (!Number.isFinite(requestedAt) || Date.now() - requestedAt < STALL_NOTIFY_MS) return;
+  const msg = `⏸ autopause [${sid8(sid)}]: pause requested at ${state.requested_at} but no complete handoff after ${Math.round((Date.now() - requestedAt) / 60000)} min — check the session`;
+  writeJsonAtomic(sp, Object.assign({}, state, { notified_at: new Date().toISOString() }));
+  if (!autopause.notify_command) { log(`${sid8(sid)} stalled pause (no autopause.notify_command to report it): ${msg}`); return; }
+  const r = spawnSync(`${autopause.notify_command} "${msg.replace(/"/g, "'")}"`, {
+    cwd: root, shell: true, encoding: 'utf8', timeout: NOTIFY_TIMEOUT_MS,
+    env: Object.assign({}, process.env, { GSD_PAUSE_MESSAGE: msg, GSD_PAUSE_SESSION_ID: sid }),
+  });
+  log(`${sid8(sid)} stalled pause reported via autopause.notify_command (rc=${r.status}): ${msg}`);
 }
 
 function findLatestContinueHere(root, roleId, hintDir) {
@@ -322,7 +403,7 @@ function main() {
   const state = readJson(sp) || {};
   const nowMs = Date.now();
 
-  const handoff = committedHandoffFor(root, sid);
+  const handoff = handoffFor(root, sid, log);
   const used = readUsedPct(sid);
   const threshold = resolveThreshold(config);
   const session = handoff ? findSession(sid) : null;
@@ -332,6 +413,8 @@ function main() {
   if (verdict.kind === 'none') {
     // Only the interesting no-ops are logged; "below threshold" every turn would drown the log.
     if (!/^used=/.test(verdict.reason)) log(`${sid8(sid)} no-op: ${verdict.reason}`);
+    // A requested pause that never completes must not stay silent for the TTL.
+    if (!(handoff && handoff.complete)) notifyStall(root, autopause, sid, state, sp, log);
     allow(undefined);
   }
 
@@ -339,10 +422,10 @@ function main() {
     const clearCmd = autopause.clear_command;
     if (!clearCmd) {
       writeJsonAtomic(sp, Object.assign({}, state, { phase: 'clear-spawned', spawned_at: new Date().toISOString(), child_pid: null, note: 'no autopause.clear_command' }));
-      log(`${sid8(sid)} handoff committed (${handoff.file}); set autopause.clear_command to automate /clear — falling back to manual /clear → /gsd-resume-work`);
+      log(`${sid8(sid)} handoff written (${handoff.file}); set autopause.clear_command to automate /clear — falling back to manual /clear → /gsd-resume-work`);
       allow(undefined);
     }
-    const md = findLatestContinueHere(root, handoff.role_id, handoff.json.phase_dir);
+    const md = handoff.mdPath;
     const env = Object.assign({}, process.env, {
       GSD_CLEAR_SESSION_ID: sid,
       GSD_CLEAR_CLAUDE_PID: session ? String(session.pid) : '',
@@ -356,7 +439,7 @@ function main() {
     const child = spawn(clearCmd, { cwd: root, shell: true, detached: true, stdio: 'ignore', windowsHide: true, env });
     child.unref();
     writeJsonAtomic(sp, Object.assign({}, state, { phase: 'clear-spawned', spawned_at: new Date().toISOString(), child_pid: child.pid || null }));
-    log(`${sid8(sid)} pause done (${handoff.file}, ${floorMs === null ? 'requested-pause rule' : `newer than session floor ${new Date(floorMs).toISOString()}`}${state.requested_at ? `, requested ${state.requested_at}` : ', not requested'}) → spawned autopause.clear_command pid=${child.pid}${session ? '' : ' (no sessions/<pid>.json — GSD_CLEAR_CLAUDE_PID empty)'}`);
+    log(`${sid8(sid)} pause done (${handoff.file}, ${floorMs === null ? 'requested-pause rule' : `newer than session floor ${new Date(floorMs).toISOString()}`}${state.requested_at ? `, requested ${state.requested_at}` : ', not requested'}, committed: ${gitState(root, handoff.rel, config)}) → spawned autopause.clear_command pid=${child.pid}${session ? '' : ' (no sessions/<pid>.json — GSD_CLEAR_CLAUDE_PID empty)'}`);
     allow(undefined);
   }
 
@@ -394,5 +477,7 @@ if (require.main === module) {
 
 module.exports = {
   REQUEST_TTL_MS, HANDOFF_SLACK_MS, DEFAULT_THRESHOLD_USED_PCT,
+  SETTLE_MS, STALL_NOTIFY_MS,
   resolveThreshold, stateDir, statePathFor, isRequested, isHandoffForRequest, isHandoffToClear, sessionFloorMs, decide, blockReason,
+  assessHandoff, gitState,
 };
