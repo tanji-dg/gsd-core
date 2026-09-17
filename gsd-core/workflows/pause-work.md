@@ -284,10 +284,10 @@ If there is such material, create or update the skill now (the `skill-creator` s
 - an external/physical state the user must see before the next session (a rig left in a temporary state, a tool left open, …)
 - a failure the resuming session cannot recover from on its own
 
-and the project configured a notifier — `.planning/config.json` `hooks.pause_notify_command` (a shell command; the one-line message is passed as `$GSD_PAUSE_MESSAGE` / `%GSD_PAUSE_MESSAGE%` and appended as the last argument) — send exactly one message:
+and the project configured a notifier — `.planning/config.json` `autopause.notify_command` (a shell command; the one-line message is passed as `$GSD_PAUSE_MESSAGE` / `%GSD_PAUSE_MESSAGE%` and appended as the last argument) — send exactly one message:
 
 ```bash
-notify_cmd=$(gsd_run config-get hooks.pause_notify_command --raw 2>/dev/null || true)
+notify_cmd=$(gsd_run config-get autopause.notify_command --raw 2>/dev/null || true)
 if [ -n "$notify_cmd" ] && [ "$notify_cmd" != "null" ]; then
   GSD_PAUSE_MESSAGE="⏸ pause [<role or role_id>]: <one line — what the user must decide/check>" sh -c "$notify_cmd \"\$GSD_PAUSE_MESSAGE\"" || true
 fi
@@ -359,7 +359,7 @@ To resume: /gsd:resume-work
 - [ ] Pre-Execution Critique section filled if pausing between design and execution
 - [ ] Committed as WIP
 - [ ] skills step done (created/updated, or `skills: no change` written in the handoff)
-- [ ] notify step done (sent only if the user must act, and only via `hooks.pause_notify_command`; recorded either way)
+- [ ] notify step done (sent only if the user must act, and only via `autopause.notify_command`; recorded either way)
 - [ ] No blocking question was asked of the user (unknowns written as `unknown`)
 - [ ] User knows location and how to resume
 </success_criteria>

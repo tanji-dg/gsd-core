@@ -1565,6 +1565,22 @@ Analyze existing codebase with parallel mapper agents. Use `--fast` for a quick 
 /gsd-map-codebase --query authentication  # Search intel for a term
 ```
 
+### `/gsd-autopause`
+
+Operate the unattended pause → `/clear` → resume cycle of the `autopause` capability. Opt-in via `autopause.enabled: true` in `config.json` (see [Configuration Reference](CONFIGURATION.md#autopause-settings) and [session-resume-hook.md](session-resume-hook.md)); when disabled, the command prints an activation hint and stops.
+
+| Subcommand | Description |
+|------------|-------------|
+| `status` (default) | This session's autopause state, unclaimed handoffs, effective `autopause.*` values, what the next Stop will do |
+| `request` | Put this session on the automatic path now (`gsd-pause-hook.js --request-now`), then run `/gsd-pause-work` |
+| `log` | Tail the pause/resume hook logs |
+
+```bash
+/gsd-autopause            # status
+/gsd-autopause request    # pause now and let the hooks clear + resume
+/gsd-autopause log
+```
+
 ### `/gsd-graphify`
 
 Build, query, and inspect the project knowledge graph stored in `.planning/graphs/`. Opt-in via `graphify.enabled: true` in `config.json` (see [Configuration Reference](CONFIGURATION.md#graphify-settings)); when disabled, the command prints an activation hint and stops.

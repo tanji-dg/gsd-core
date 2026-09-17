@@ -452,6 +452,78 @@ const capabilities = {
       }
     }
   },
+  "autopause": {
+    "id": "autopause",
+    "role": "feature",
+    "version": "1.14.0",
+    "title": "Unattended pause → /clear → resume",
+    "description": "Default-off capability that lets a long-running session pause itself at a context threshold, be cleared, and resume in a fresh session without a human in the loop — for sessions that share one .planning/ under a role. Two host hooks carry it (hooks/gsd-pause-hook.js on Stop, hooks/gsd-resume-hook.js on SessionStart(clear); both no-op unless autopause.enabled). The pause hook asks the session to run /gsd-pause-work at autopause.threshold_used_pct (answering Stop with decision:block) and, once the requested handoff is committed, spawns autopause.clear_command detached. The resume hook, on a pending record addressed to its own Claude Code process, claims the role-keyed handoff, runs autopause.claim_command, `state session-resume`, commits only the two .latest deletions, and injects the handoff + a STATE.md excerpt (+ autopause.context_command output). Everything environment-specific — how /clear is typed into the session, role registries, notifications — is a *_command extension point; GSD ships none of it.",
+    "tier": "full",
+    "requires": [],
+    "engines": {
+      "gsd": ">=1.14.0"
+    },
+    "runtimeCompat": {
+      "supported": [
+        "claude"
+      ],
+      "unsupported": [],
+      "notes": {
+        "claude": "Rides on Claude Code's Stop / SessionStart(source=clear) hook events and the statusline's claude-ctx-<sid>.json bridge."
+      }
+    },
+    "skills": [
+      "autopause"
+    ],
+    "agents": [],
+    "activationKey": "autopause.enabled",
+    "config": {
+      "autopause.enabled": {
+        "type": "boolean",
+        "default": false,
+        "description": "Master toggle. Off: the pause hook does nothing and the resume hook only lists unclaimed HANDOFF.latest.*.json files (safe without opt-in). On: the unattended cycle runs whenever the *_command keys below are configured."
+      },
+      "autopause.threshold_used_pct": {
+        "type": "number",
+        "default": 65,
+        "description": "Context used% at or above which the Stop hook asks the session to run /gsd-pause-work. When absent the hook derives 100 − hooks.context_warning_threshold (the context monitor's WARNING point), which is 65 with the monitor's default; the registry default mirrors that."
+      },
+      "autopause.guard_command": {
+        "type": "string",
+        "default": "",
+        "description": "Shell command run before a pause is requested. Exit 0 → request; non-zero → not now (first output line logged as the reason). Env: GSD_PAUSE_SESSION_ID, GSD_PAUSE_CLAUDE_PID, GSD_PAUSE_USED_PCT. The place for project-specific \"not now\" flags."
+      },
+      "autopause.clear_command": {
+        "type": "string",
+        "default": "",
+        "description": "Shell command spawned DETACHED once the requested pause is committed — the project's way of typing /clear into the session (tmux send-keys, …) and writing autopause.pending_file for the resume hook. Env: GSD_CLEAR_SESSION_ID (old id), GSD_CLEAR_CLAUDE_PID, GSD_CLEAR_SESSION_NAME, GSD_CLEAR_ROLE, GSD_CLEAR_ROLE_ID, GSD_CLEAR_HANDOFF_JSON, GSD_CLEAR_HANDOFF_MD, GSD_CLEAR_STATE_DIR. Empty: the hook logs and the manual /clear → /gsd-resume-work path applies."
+      },
+      "autopause.pending_file": {
+        "type": "string",
+        "default": ".claude/gsd-resume/pending.json",
+        "description": "Project-relative path (kept inside the project) of the pending record the clear command writes and the resume hook consumes: { version, at, claude_pid, old_sid, role, role_id, handoff_json_path?, handoff_md_path?, only_clear? }. The resume hook's resumed.json ack, the pause hook's state.<sid>.json and both logs live in the same directory."
+      },
+      "autopause.claim_command": {
+        "type": "string",
+        "default": "",
+        "description": "Shell command the resume hook runs right after claiming the handoff and before `state session-resume` — role registry registration, milestone.lock re-keying, anything project-specific. Env: GSD_RESUME_SESSION_ID, GSD_RESUME_OLD_SESSION_ID, GSD_RESUME_ROLE, GSD_RESUME_ROLE_ID, GSD_RESUME_HANDOFF_JSON, GSD_RESUME_HANDOFF_MD, CLAUDE_CODE_SESSION_ID (= the new id). A non-zero exit is reported in the injected context, never fatal."
+      },
+      "autopause.context_command": {
+        "type": "string",
+        "default": "",
+        "description": "Shell command the resume hook runs after the claim; on exit 0 its stdout (≤ 4 KB, else truncated) is appended to the injected context under \"### Project context\" — for per-role lines a project keeps outside the handoff (a coordinator's notes to a successor in STATE.md ## Session Continuity, …). Same GSD_RESUME_* env as claim_command; 10 s timeout."
+      },
+      "autopause.notify_command": {
+        "type": "string",
+        "default": "",
+        "description": "Shell command /gsd-pause-work's notify step runs — only when the pause ends with something the user must act on. The one-line message is appended as the last argument and exported as GSD_PAUSE_MESSAGE. Empty: no notification."
+      }
+    },
+    "hooks": [],
+    "steps": [],
+    "contributions": [],
+    "gates": []
+  },
   "broken-windows": {
     "id": "broken-windows",
     "role": "feature",
@@ -4183,6 +4255,7 @@ const capabilities = {
 
 const bySkill = {
   "ai-integration-phase": "ai-integration",
+  "autopause": "autopause",
   "code-review": "code-review",
   "graphify": "graphify",
   "mempalace-recall": "mempalace",
@@ -4823,6 +4896,14 @@ const configKeys = {
   "review.max_prompt_tokens_per_reviewer.antigravity": "antigravity",
   "review.timeouts.antigravity": "antigravity",
   "workflow.assumption_delta": "assumption-delta",
+  "autopause.enabled": "autopause",
+  "autopause.threshold_used_pct": "autopause",
+  "autopause.guard_command": "autopause",
+  "autopause.clear_command": "autopause",
+  "autopause.pending_file": "autopause",
+  "autopause.claim_command": "autopause",
+  "autopause.context_command": "autopause",
+  "autopause.notify_command": "autopause",
   "workflow.windows_enforce": "broken-windows",
   "review.models.claude": "claude",
   "review.max_prompt_tokens_per_reviewer.claude": "claude",
@@ -4941,6 +5022,54 @@ const configSchema = {
     "type": "boolean",
     "default": true,
     "description": "Enable the assumption-delta architecture checkpoint during planning. When a pluralization/optional/chosen signal is detected in the phase scope, the planner is prompted to re-ask whether the primary key / identity model still names the right thing. Advisory (non-blocking)."
+  },
+  "autopause.enabled": {
+    "owner": "autopause",
+    "type": "boolean",
+    "default": false,
+    "description": "Master toggle. Off: the pause hook does nothing and the resume hook only lists unclaimed HANDOFF.latest.*.json files (safe without opt-in). On: the unattended cycle runs whenever the *_command keys below are configured."
+  },
+  "autopause.threshold_used_pct": {
+    "owner": "autopause",
+    "type": "number",
+    "default": 65,
+    "description": "Context used% at or above which the Stop hook asks the session to run /gsd-pause-work. When absent the hook derives 100 − hooks.context_warning_threshold (the context monitor's WARNING point), which is 65 with the monitor's default; the registry default mirrors that."
+  },
+  "autopause.guard_command": {
+    "owner": "autopause",
+    "type": "string",
+    "default": "",
+    "description": "Shell command run before a pause is requested. Exit 0 → request; non-zero → not now (first output line logged as the reason). Env: GSD_PAUSE_SESSION_ID, GSD_PAUSE_CLAUDE_PID, GSD_PAUSE_USED_PCT. The place for project-specific \"not now\" flags."
+  },
+  "autopause.clear_command": {
+    "owner": "autopause",
+    "type": "string",
+    "default": "",
+    "description": "Shell command spawned DETACHED once the requested pause is committed — the project's way of typing /clear into the session (tmux send-keys, …) and writing autopause.pending_file for the resume hook. Env: GSD_CLEAR_SESSION_ID (old id), GSD_CLEAR_CLAUDE_PID, GSD_CLEAR_SESSION_NAME, GSD_CLEAR_ROLE, GSD_CLEAR_ROLE_ID, GSD_CLEAR_HANDOFF_JSON, GSD_CLEAR_HANDOFF_MD, GSD_CLEAR_STATE_DIR. Empty: the hook logs and the manual /clear → /gsd-resume-work path applies."
+  },
+  "autopause.pending_file": {
+    "owner": "autopause",
+    "type": "string",
+    "default": ".claude/gsd-resume/pending.json",
+    "description": "Project-relative path (kept inside the project) of the pending record the clear command writes and the resume hook consumes: { version, at, claude_pid, old_sid, role, role_id, handoff_json_path?, handoff_md_path?, only_clear? }. The resume hook's resumed.json ack, the pause hook's state.<sid>.json and both logs live in the same directory."
+  },
+  "autopause.claim_command": {
+    "owner": "autopause",
+    "type": "string",
+    "default": "",
+    "description": "Shell command the resume hook runs right after claiming the handoff and before `state session-resume` — role registry registration, milestone.lock re-keying, anything project-specific. Env: GSD_RESUME_SESSION_ID, GSD_RESUME_OLD_SESSION_ID, GSD_RESUME_ROLE, GSD_RESUME_ROLE_ID, GSD_RESUME_HANDOFF_JSON, GSD_RESUME_HANDOFF_MD, CLAUDE_CODE_SESSION_ID (= the new id). A non-zero exit is reported in the injected context, never fatal."
+  },
+  "autopause.context_command": {
+    "owner": "autopause",
+    "type": "string",
+    "default": "",
+    "description": "Shell command the resume hook runs after the claim; on exit 0 its stdout (≤ 4 KB, else truncated) is appended to the injected context under \"### Project context\" — for per-role lines a project keeps outside the handoff (a coordinator's notes to a successor in STATE.md ## Session Continuity, …). Same GSD_RESUME_* env as claim_command; 10 s timeout."
+  },
+  "autopause.notify_command": {
+    "owner": "autopause",
+    "type": "string",
+    "default": "",
+    "description": "Shell command /gsd-pause-work's notify step runs — only when the pause ends with something the user must act on. The one-line message is appended as the last argument and exported as GSD_PAUSE_MESSAGE. Empty: no notification."
   },
   "workflow.windows_enforce": {
     "owner": "broken-windows",
@@ -7946,6 +8075,9 @@ const capabilityClusters = {
   "ai-integration": [
     "ai-integration-phase"
   ],
+  "autopause": [
+    "autopause"
+  ],
   "code-review": [
     "code-review"
   ],
@@ -7973,6 +8105,12 @@ const capabilityClusters = {
 
 const profileMembership = {
   "ai-integration": {
+    "tier": "full",
+    "profiles": [
+      "full"
+    ]
+  },
+  "autopause": {
     "tier": "full",
     "profiles": [
       "full"
@@ -8028,6 +8166,7 @@ const _requiresGraph = {
   "assumption-delta": [],
   "audit": [],
   "augment": [],
+  "autopause": [],
   "broken-windows": [],
   "claude": [],
   "claude-orchestration": [],

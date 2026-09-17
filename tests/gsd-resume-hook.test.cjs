@@ -33,9 +33,21 @@ describe('pure pieces', () => {
   test('resolvePendingPath: default, configured, and never outside the project', () => {
     const root = path.resolve(os.tmpdir(), 'proj');
     assert.equal(hook.resolvePendingPath(root, {}), path.resolve(root, hook.DEFAULT_PENDING_FILE));
-    assert.equal(hook.resolvePendingPath(root, { hooks: { resume_pending_file: '.claude/autoclear/pending.json' } }), path.resolve(root, '.claude/autoclear/pending.json'));
-    assert.equal(hook.resolvePendingPath(root, { hooks: { resume_pending_file: '../../evil.json' } }), path.resolve(root, hook.DEFAULT_PENDING_FILE));
-    assert.equal(hook.resolvePendingPath(root, { hooks: { resume_pending_file: '.' } }), path.resolve(root, hook.DEFAULT_PENDING_FILE));
+    assert.equal(hook.resolvePendingPath(root, { autopause: { pending_file: '.claude/autoclear/pending.json' } }), path.resolve(root, '.claude/autoclear/pending.json'));
+    assert.equal(hook.resolvePendingPath(root, { autopause: { pending_file: '../../evil.json' } }), path.resolve(root, hook.DEFAULT_PENDING_FILE));
+    assert.equal(hook.resolvePendingPath(root, { autopause: { pending_file: '.' } }), path.resolve(root, hook.DEFAULT_PENDING_FILE));
+    // the pre-capability spelling is NOT read
+    assert.equal(hook.resolvePendingPath(root, { hooks: { resume_pending_file: '.claude/autoclear/pending.json' } }), path.resolve(root, hook.DEFAULT_PENDING_FILE));
+  });
+
+  test('readAutopauseConfig: defaults, enabled must be literally true, only autopause.* is read', () => {
+    assert.deepEqual(hook.readAutopauseConfig('', {}), { ...hook.AUTOPAUSE_DEFAULTS, threshold_used_pct: undefined });
+    assert.equal(hook.readAutopauseConfig('', { autopause: { enabled: 'true' } }).enabled, false);
+    assert.equal(hook.readAutopauseConfig('', { autopause: { enabled: true } }).enabled, true);
+    const c = hook.readAutopauseConfig('', { autopause: { clear_command: ' x ', threshold_used_pct: 80 }, hooks: { clear_command: 'ignored' } });
+    assert.equal(c.clear_command, 'x');
+    assert.equal(c.threshold_used_pct, 80);
+    assert.equal(hook.readAutopauseConfig('', { hooks: { resume_claim_command: 'ignored' } }).claim_command, '');
   });
 
   test('decideSkipReason: every precondition', () => {
@@ -110,10 +122,29 @@ describe('registration', () => {
     assert.ok(group.hooks.some((h) => /gsd-resume-hook\.js/.test(h.command)));
   });
 
-  test('config keys are declared', () => {
+  test('trimContextOutput: empty, small, 4 KB cut', () => {
+    assert.equal(hook.trimContextOutput('  \r\n '), '');
+    assert.equal(hook.trimContextOutput('a\r\nb\n'), 'a\nb');
+    const out = hook.trimContextOutput('い'.repeat(3000)); // 9 KB
+    assert.ok(Buffer.byteLength(out, 'utf8') <= hook.CONTEXT_LIMIT_BYTES + 30);
+    assert.match(out, /<!-- TRUNCATED -->$/);
+    assert.ok(!out.includes('�'));
+  });
+
+  test('autopause capability owns the config keys (registry, not the core manifest)', () => {
+    const cap = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'capabilities', 'autopause', 'capability.json'), 'utf8'));
+    assert.equal(cap.activationKey, 'autopause.enabled');
+    assert.equal(cap.config['autopause.enabled'].default, false);
+    for (const k of ['autopause.threshold_used_pct', 'autopause.guard_command', 'autopause.clear_command', 'autopause.pending_file', 'autopause.claim_command', 'autopause.context_command', 'autopause.notify_command']) {
+      assert.ok(cap.config[k], k);
+    }
+    assert.equal(cap.config['autopause.pending_file'].default, hook.DEFAULT_PENDING_FILE);
+    const { isValidConfigKey } = require('../gsd-core/bin/lib/config-schema.cjs');
+    assert.equal(isValidConfigKey('autopause.enabled'), true);
+    assert.equal(isValidConfigKey('autopause.clear_command'), true);
     const schema = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'gsd-core', 'bin', 'shared', 'config-schema.manifest.json'), 'utf8'));
-    for (const k of ['hooks.pause_notify_command', 'hooks.resume_pending_file', 'hooks.resume_claim_command']) {
-      assert.ok(schema.validKeys.includes(k), k);
+    for (const k of ['hooks.pause_notify_command', 'hooks.resume_pending_file', 'hooks.resume_claim_command', 'hooks.resume_context_command', 'hooks.clear_command']) {
+      assert.ok(!schema.validKeys.includes(k), `${k} must not survive as a second config surface`);
     }
   });
 
@@ -123,7 +154,7 @@ describe('registration', () => {
     assert.doesNotMatch(body, /Ask user for clarifications if needed via conversational questions/);
     assert.match(body, /<step name="skills">/);
     assert.match(body, /<step name="notify">/);
-    assert.match(body, /hooks\.pause_notify_command/);
+    assert.match(body, /autopause\.notify_command/);
     assert.match(body, /Role source of truth/);
   });
 });
@@ -151,7 +182,7 @@ describe('end to end (scratch git project)', () => {
     fs.writeFileSync(path.join(dir, '.planning', 'phases', '02-x', '.continue-here.latest.coordinator.md'), '# handoff\n\n<next_action>\nStart with: task 3\n</next_action>\n');
     fs.writeFileSync(path.join(dir, '.planning', 'HANDOFF.latest.design.json'), JSON.stringify({ role: 'design' }));
     fs.writeFileSync(path.join(dir, '.planning', 'config.json'), JSON.stringify({
-      hooks: { resume_claim_command: `${JSON.stringify(process.execPath)} -e "console.log('claim-hook', process.env.GSD_RESUME_ROLE_ID, process.env.GSD_RESUME_SESSION_ID)"` },
+      autopause: { enabled: true, claim_command: `${JSON.stringify(process.execPath)} -e "console.log('claim-hook', process.env.GSD_RESUME_ROLE_ID, process.env.GSD_RESUME_SESSION_ID)"` },
     }));
     gitOrThrow(['add', '-A'], { cwd: dir });
     gitOrThrow(['commit', '-q', '-m', 'wip: paused'], { cwd: dir });
@@ -237,7 +268,7 @@ describe('end to end (scratch git project)', () => {
     assert.match(r.context, /^# Automatic resume \(gsd-resume-hook\) — role: coordinator {2}previous session OLD → NEW/);
     assert.match(r.context, /Do not run `\/gsd-resume-work`/);
     assert.match(r.context, /`next_action`: run the phase 2 task 3 build/);
-    assert.match(r.context, /resume_claim_command ok — claim-hook coordinator NEW/);
+    assert.match(r.context, /claim_command ok — claim-hook coordinator NEW/);
     assert.match(r.context, /state session-resume: .*Stopped At.* record=\.planning\/sessions\/NEW\.json removed=\.planning\/HANDOFF\.claimed\.coordinator\.NEW\.json status paused→executing/);
     assert.match(r.context, /consumed commit [0-9a-f]{7}/);
     assert.match(r.context, /### STATE\.md excerpt[\s\S]*status: executing[\s\S]*## Current Position/);
@@ -299,9 +330,75 @@ describe('end to end (scratch git project)', () => {
     assert.equal(JSON.parse(fs.readFileSync(path.join(dir, '.claude', 'gsd-resume', 'resumed.json'), 'utf8')).note, 'only-clear');
   });
 
-  test('custom hooks.resume_pending_file is honoured', (t) => {
+  function contextScript(t, body) {
+    const script = path.join(os.tmpdir(), `gsd-resume-hook-ctx-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2)}.cjs`);
+    t.after(() => { try { fs.unlinkSync(script); } catch { /* gone */ } });
+    fs.writeFileSync(script, body);
+    return `${JSON.stringify(process.execPath)} ${JSON.stringify(script)}`;
+  }
+
+  function setContextCommand(dir, cmd) {
+    const cfgPath = path.join(dir, '.planning', 'config.json');
+    const cfg = JSON.parse(fs.readFileSync(cfgPath, 'utf8'));
+    cfg.autopause.context_command = cmd;
+    fs.writeFileSync(cfgPath, JSON.stringify(cfg));
+    gitOrThrow(['commit', '-q', '-am', 'cfg'], { cwd: dir });
+  }
+
+  test('resume_context_command: stdout appended under "### Project context" with the GSD_RESUME_* env', (t) => {
     const { dir, cfg } = makeProject(t);
-    fs.writeFileSync(path.join(dir, '.planning', 'config.json'), JSON.stringify({ hooks: { resume_pending_file: '.claude/autoclear/pending.json' } }));
+    setContextCommand(dir, contextScript(t, "console.log('successor note for ' + process.env.GSD_RESUME_ROLE_ID + ' from ' + process.env.GSD_RESUME_OLD_SESSION_ID);\n"));
+    writePending(dir);
+    fs.writeFileSync(path.join(cfg, 'sessions', '99999999.json'), JSON.stringify({ sessionId: 'NEW' }));
+    const r = run(dir, cfg, { session_id: 'NEW', source: 'clear' });
+    assert.equal(r.exitCode, 0, r.stderr);
+    assert.match(r.context, /\n---\n### Project context \(autopause\.context_command\)\n\nsuccessor note for coordinator from OLD\n$/);
+    assert.match(r.context, /context_command: \d+ bytes appended/);
+  });
+
+  test('resume_context_command: output over 4 KB is cut with a TRUNCATED marker', (t) => {
+    const { dir, cfg } = makeProject(t);
+    setContextCommand(dir, contextScript(t, "process.stdout.write('x'.repeat(10000));\n"));
+    writePending(dir);
+    fs.writeFileSync(path.join(cfg, 'sessions', '99999999.json'), JSON.stringify({ sessionId: 'NEW' }));
+    const r = run(dir, cfg, { session_id: 'NEW', source: 'clear' });
+    assert.equal(r.exitCode, 0, r.stderr);
+    const section = r.context.split('### Project context (autopause.context_command)')[1];
+    assert.ok(section, 'section present');
+    assert.ok(Buffer.byteLength(section, 'utf8') < 4 * 1024 + 64);
+    assert.match(section, /x{100}\n<!-- TRUNCATED -->/);
+  });
+
+  test('resume_context_command: non-zero exit appends nothing (noted in the record)', (t) => {
+    const { dir, cfg } = makeProject(t);
+    setContextCommand(dir, contextScript(t, "console.log('should not appear'); process.exit(2);\n"));
+    writePending(dir);
+    fs.writeFileSync(path.join(cfg, 'sessions', '99999999.json'), JSON.stringify({ sessionId: 'NEW' }));
+    const r = run(dir, cfg, { session_id: 'NEW', source: 'clear' });
+    assert.equal(r.exitCode, 0, r.stderr);
+    assert.doesNotMatch(r.context, /Project context/);
+    assert.doesNotMatch(r.context, /should not appear/);
+    assert.match(r.context, /★ context_command failed \(rc=2\) — nothing appended/);
+  });
+
+  test('autopause.enabled false → listing only, even with a pending record addressed to us', (t) => {
+    const { dir, cfg } = makeProject(t);
+    fs.writeFileSync(path.join(dir, '.planning', 'config.json'), JSON.stringify({ autopause: { enabled: false } }));
+    writePending(dir);
+    fs.writeFileSync(path.join(cfg, 'sessions', '99999999.json'), JSON.stringify({ sessionId: 'NEW' }));
+    const before = gitOrThrow(['rev-parse', 'HEAD'], { cwd: dir }).trim();
+    const r = run(dir, cfg, { session_id: 'NEW', source: 'clear' });
+    assert.equal(r.exitCode, 0, r.stderr);
+    assert.match(r.context, /Not auto-claimed \(autopause\.enabled is false\)/);
+    assert.ok(fs.existsSync(path.join(dir, '.planning', 'HANDOFF.latest.coordinator.json')));
+    assert.ok(fs.existsSync(path.join(dir, '.claude', 'gsd-resume', 'pending.json')));
+    assert.equal(gitOrThrow(['rev-parse', 'HEAD'], { cwd: dir }).trim(), before);
+    assert.ok(!fs.existsSync(path.join(dir, '.claude', 'gsd-resume', 'gsd-resume-hook.log')), 'nothing written while disabled');
+  });
+
+  test('custom autopause.pending_file is honoured', (t) => {
+    const { dir, cfg } = makeProject(t);
+    fs.writeFileSync(path.join(dir, '.planning', 'config.json'), JSON.stringify({ autopause: { enabled: true, pending_file: '.claude/autoclear/pending.json' } }));
     fs.mkdirSync(path.join(dir, '.claude', 'autoclear'), { recursive: true });
     fs.writeFileSync(path.join(dir, '.claude', 'autoclear', 'pending.json'), JSON.stringify({
       version: 1, at: new Date().toISOString(), claude_pid: 99999999, old_sid: 'OLD', role: 'coordinator', role_id: 'coordinator',
