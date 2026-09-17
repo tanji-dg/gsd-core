@@ -107,8 +107,8 @@ has to provide the two shell commands GSD cannot: an optional guard and the
 every Stop                      gsd-pause-hook.js
 ──────────                      ─────────────────
                                 used% = <tmpdir>/claude-ctx-<sid>.json (gsd-statusline.js)
-(b) our requested pause is      → spawn autopause.clear_command DETACHED (env below),
-    committed on disk             state → clear-spawned
+(b) OUR handoff is committed    → spawn autopause.clear_command DETACHED (env below),
+    and newer than this session   state → clear-spawned
 (a) used% ≥ threshold ∧ not     → autopause.guard_command (exit 0 = go)
     requested (30 min TTL) ∧      → state → pause-requested
     !stop_hook_active             → {"decision":"block","reason":"run gsd-pause-work now …"}
@@ -118,11 +118,17 @@ otherwise                       → nothing
 - The block reason tells the session to run `gsd-pause-work` through the WIP
   commit, ask nothing (unknown → `unknown`) and **measure** state rather than
   recall it.
-- (b) accepts only a handoff written for the request: `HANDOFF.latest.<role_id>.json`
-  with `session_id` == ours, committed (`git diff --quiet HEAD`), timestamp ≥
-  `requested_at − 60 s`. A **manual** pause is never cleared automatically:
-  above the threshold (a) re-requests so the handoff is rewritten from current
-  state; below it the session stays paused (logged).
+- (b) accepts a `HANDOFF.latest.<role_id>.json` with `session_id` == ours, committed
+  (`git diff --quiet HEAD`), whose timestamp is **newer than this session** —
+  `max(<config>/sessions/<pid>.json.startedAt, state.spawned_at, state.resumed_at)`,
+  the last written by the resume hook. Whether the hook requested the pause or
+  the user ran `/gsd-pause-work` by hand makes no difference: **a pause
+  committed in this session is the decision to hand over** — the arm step is not
+  a precondition. The floor is what keeps a previous session's handoff, or one
+  already spawned for, from clearing us. Only `keep-session` (30 min) opts out.
+  When neither `startedAt` nor `resumed_at` is known the hook falls back to the
+  stricter requested-pause rule (timestamp ≥ `requested_at − 60 s`) — it never
+  guesses.
 - `node gsd-pause-hook.js --request-now` (from the session's own Bash;
   `CLAUDE_CODE_SESSION_ID`) writes `pause-requested` (`manual: true`) unless a
   live request exists; `--keep-session` writes `keep-session`. Both are no-ops

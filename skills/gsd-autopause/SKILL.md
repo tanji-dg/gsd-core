@@ -114,12 +114,11 @@ Summarise: last request, last spawn, last resume, any line starting with `★`.
 
 ## What the operator needs to know
 
-- **Every pause resumes automatically** while autopause is enabled — `/gsd-pause-work` arms
-  the cycle itself at its start, so a hand-run pause is cleared and resumed exactly like a
-  hook-requested one. To stay paused, say so: `/gsd-pause-work --keep-session` (30 min).
-  A handoff written by an older pause-work without the arming step is treated as manual:
-  above the threshold the next Stop re-requests so it is rewritten from *measured* state;
-  below it the session stays paused — `request` puts it on the automatic path.
+- **Every pause resumes automatically** while autopause is enabled — the next Stop after a
+  handoff of this session is committed (newer than the session's start / last resume) clears
+  and resumes, hook-requested or hand-run alike. To stay paused, say so first:
+  `/gsd-pause-work --keep-session` (30 min). `request` only records the request (and is
+  the fallback when the host's `sessions/<pid>.json` has no `startedAt`).
 - **The context monitor knows.** Its CONTEXT WARNING / CRITICAL text says the automatic pause
   will run at the threshold and asks the agent to finish the current step instead of running
   `/gsd-pause-work` early; the threshold defaults to `100 − hooks.context_critical_threshold`.

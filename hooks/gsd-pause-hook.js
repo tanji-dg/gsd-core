@@ -14,14 +14,21 @@
 //       → record `pause-requested` in the state file and answer
 //         {"decision":"block","reason":"…"} so THIS session runs
 //         /gsd-pause-work now (unattended: no questions, measured state).
-//   (b) the requested pause is done — a HANDOFF.latest.<role_id>.json with
-//       session_id == ours, committed (git clean), timestamp ≥ requested_at − 60 s
-//       → spawn `autopause.clear_command` DETACHED (stdio ignore, unref) and record
-//         `clear-spawned`. The command is the project's way of typing /clear
-//         into this session (tmux send-keys, …) — GSD ships no such thing.
-//       A MANUAL pause (nothing requested) is never used here: above the
-//       threshold (a) re-requests so the handoff is rewritten from measured,
-//       current state; below it the session simply stays paused (logged).
+//   (b) OUR pause is committed — a HANDOFF.latest.<role_id>.json with
+//       session_id == ours, committed (git clean), and NEWER than this session
+//       (timestamp > max(<config>/sessions/<pid>.json.startedAt, state.spawned_at,
+//       state.resumed_at)) → spawn `autopause.clear_command` DETACHED (stdio
+//       ignore, unref) and record `clear-spawned`. The command is the project's
+//       way of typing /clear into this session (tmux send-keys, …) — GSD ships
+//       no such thing. Whether the pause was hook-requested or hand-run does
+//       not matter: a pause committed in this session IS the decision to hand
+//       over (the arm step in pause-work.md is a courtesy, not a precondition —
+//       a model that re-runs an older procedure from memory must not silently
+//       strand the session). The lower bound is what keeps an older handoff
+//       (a previous session's, or one already spawned for) from clearing us.
+//       Only `keep-session` (30 min) opts out. When NEITHER startedAt nor
+//       resumed_at is known the hook falls back to the stricter "requested
+//       pause" rule (timestamp ≥ requested_at − 60 s) rather than guessing.
 //       No clear_command → logged ("set autopause.clear_command …"), the manual
 //       /clear → /gsd-resume-work path applies.
 //   (c) `--request-now` (CLI, no stdin; CLAUDE_CODE_SESSION_ID): arm the
@@ -134,15 +141,27 @@ function isHandoffForRequest(handoffJson, state, nowMs) {
 }
 
 /**
+ * Is this committed handoff one that should clear us? With a known session
+ * floor: strictly newer than it. Without one: the requested-pause rule.
+ */
+function isHandoffToClear(handoffJson, state, floorMs, nowMs) {
+  const at = Date.parse((handoffJson && handoffJson.timestamp) || '');
+  if (!Number.isFinite(at)) return false;
+  if (floorMs !== null && floorMs !== undefined) return at > floorMs;
+  return isHandoffForRequest(handoffJson, state, nowMs);
+}
+
+/**
  * Decide the turn's action from already-gathered facts. Returns one of
  *   { kind: 'spawn-clear' } | { kind: 'request', used, threshold }
  *   | { kind: 'none', reason }
+ * `floorMs` is sessionFloorMs(); null means "unknown" (fallback rule).
  */
-function decide({ stopHookActive, state, handoff, used, threshold, nowMs }) {
+function decide({ stopHookActive, state, handoff, used, threshold, nowMs, floorMs = null }) {
   const requested = isRequested(state, nowMs);
-  if (handoff && isHandoffForRequest(handoff.json, state, nowMs)) {
-    if (state.phase === 'clear-spawned') return { kind: 'none', reason: 'clear already spawned' };
-    if (state.phase === 'keep-session') return { kind: 'none', reason: `keep-session (${handoff.file}) — staying paused by request` };
+  if (handoff && isHandoffToClear(handoff.json, state, floorMs, nowMs)) {
+    if (requested && state.phase === 'keep-session') return { kind: 'none', reason: `keep-session (${handoff.file}) — staying paused by request` };
+    if (floorMs === null && state.phase === 'clear-spawned') return { kind: 'none', reason: 'clear already spawned' };
     return { kind: 'spawn-clear' };
   }
   if (stopHookActive) return { kind: 'none', reason: 'stop_hook_active (the Stop after our own block)' };
@@ -179,9 +198,27 @@ function findSession(sid) {
   for (const n of names) {
     if (!/^\d+\.json$/.test(n)) continue;
     const j = readJson(path.join(claudeHome(), 'sessions', n));
-    if (j && j.sessionId === sid) return { pid: Number(n.slice(0, -5)), name: typeof j.name === 'string' ? j.name : '' };
+    if (j && j.sessionId === sid) {
+      const started = Number(j.startedAt);
+      return { pid: Number(n.slice(0, -5)), name: typeof j.name === 'string' ? j.name : '', startedAt: Number.isFinite(started) && started > 0 ? started : null };
+    }
   }
   return null;
+}
+
+/**
+ * The instant this session "began" for (b)'s purposes: the latest of the
+ * host's startedAt, the last clear we spawned and the resume that created
+ * this session. A handoff must be NEWER than this to clear us. null when
+ * none is known → the caller falls back to the requested-pause rule.
+ */
+function sessionFloorMs(session, state) {
+  const cands = [
+    session && session.startedAt,
+    state && Date.parse(state.spawned_at || ''),
+    state && Date.parse(state.resumed_at || ''),
+  ].filter((v) => Number.isFinite(v) && v > 0);
+  return cands.length ? Math.max(...cands) : null;
 }
 
 function gitClean(root, rel) {
@@ -288,7 +325,9 @@ function main() {
   const handoff = committedHandoffFor(root, sid);
   const used = readUsedPct(sid);
   const threshold = resolveThreshold(config);
-  const verdict = decide({ stopHookActive: input.stop_hook_active === true, state, handoff, used, threshold, nowMs });
+  const session = handoff ? findSession(sid) : null;
+  const floorMs = handoff ? sessionFloorMs(session, state) : null;
+  const verdict = decide({ stopHookActive: input.stop_hook_active === true, state, handoff, used, threshold, nowMs, floorMs });
 
   if (verdict.kind === 'none') {
     // Only the interesting no-ops are logged; "below threshold" every turn would drown the log.
@@ -303,7 +342,6 @@ function main() {
       log(`${sid8(sid)} handoff committed (${handoff.file}); set autopause.clear_command to automate /clear — falling back to manual /clear → /gsd-resume-work`);
       allow(undefined);
     }
-    const session = findSession(sid);
     const md = findLatestContinueHere(root, handoff.role_id, handoff.json.phase_dir);
     const env = Object.assign({}, process.env, {
       GSD_CLEAR_SESSION_ID: sid,
@@ -318,7 +356,7 @@ function main() {
     const child = spawn(clearCmd, { cwd: root, shell: true, detached: true, stdio: 'ignore', windowsHide: true, env });
     child.unref();
     writeJsonAtomic(sp, Object.assign({}, state, { phase: 'clear-spawned', spawned_at: new Date().toISOString(), child_pid: child.pid || null }));
-    log(`${sid8(sid)} pause done (${handoff.file}) → spawned autopause.clear_command pid=${child.pid}${session ? '' : ' (no sessions/<pid>.json — GSD_CLEAR_CLAUDE_PID empty)'}`);
+    log(`${sid8(sid)} pause done (${handoff.file}, ${floorMs === null ? 'requested-pause rule' : `newer than session floor ${new Date(floorMs).toISOString()}`}${state.requested_at ? `, requested ${state.requested_at}` : ', not requested'}) → spawned autopause.clear_command pid=${child.pid}${session ? '' : ' (no sessions/<pid>.json — GSD_CLEAR_CLAUDE_PID empty)'}`);
     allow(undefined);
   }
 
@@ -356,5 +394,5 @@ if (require.main === module) {
 
 module.exports = {
   REQUEST_TTL_MS, HANDOFF_SLACK_MS, DEFAULT_THRESHOLD_USED_PCT,
-  resolveThreshold, stateDir, statePathFor, isRequested, isHandoffForRequest, decide, blockReason,
+  resolveThreshold, stateDir, statePathFor, isRequested, isHandoffForRequest, isHandoffToClear, sessionFloorMs, decide, blockReason,
 };
