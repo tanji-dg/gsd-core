@@ -37,11 +37,10 @@
 //      stdout (≤ 4 KB) as "### Project context" — the extension point for
 //      per-role lines the project keeps outside the handoff (e.g. a
 //      coordinator's notes to a successor in STATE.md ## Session Continuity)
-//   5. injects, as additionalContext: the handoff markdown — the FULL text
-//      (up to 32 KB) when git cannot give it back, the first 8 KB + a
-//      `git show` pointer only when the consumed commit's parent holds it;
-//      over 32 KB the claimed markdown is left on disk and the text says
-//      "Read <path> and delete it" — a handoff is never lost —, a STATE.md
+//   5. injects, as additionalContext: the handoff markdown in FULL (up to
+//      32 KB); over that, the first 8 KB and the claimed markdown is left on
+//      disk with "Read <path> and delete it" — decided by size only, never by
+//      whether git could give the text back — a handoff is never lost —, a STATE.md
 //      excerpt (frontmatter keys + the first 40 lines of ## Current Position)
 //      and three lines of instructions — so /gsd-resume-work is NOT needed
 //   6. writes a RESUMED file next to the pending file (the watcher's ack)
@@ -218,28 +217,19 @@ function trackedAndClean(root, rel) {
 }
 
 /**
- * The markdown as injected. `recoverable` = git holds the full text (the
- * consumed commit's parent) → the classic 8 KB cut with a `git show` pointer.
- * Otherwise the full text up to MD_FULL_LIMIT_BYTES; beyond that the first
- * 8 KB plus an instruction to Read `keepPath` (left on disk) and delete it.
+ * The markdown as injected — by SIZE only (git is irrelevant here): the full
+ * text up to MD_FULL_LIMIT_BYTES; beyond that the first MD_LIMIT_BYTES plus an
+ * instruction to Read `keepPath` (left on disk) and delete it.
  * Returns { text, keepFile } — keepFile true when the claimed MD must stay.
  */
-function injectableMarkdown(mdText, { recoverable, gitRef, relPath, keepPath }) {
+function injectableMarkdown(mdText, { keepPath }) {
   const bytes = Buffer.byteLength(mdText, 'utf8');
-  if (recoverable) return { text: truncateMarkdown(mdText, gitRef, relPath), keepFile: false };
   if (bytes <= MD_FULL_LIMIT_BYTES) return { text: mdText, keepFile: false };
   const cut = Buffer.from(mdText, 'utf8').subarray(0, MD_LIMIT_BYTES).toString('utf8').replace(/�+$/, '');
   return {
-    text: `${cut}\n<!-- TRUNCATED: ${bytes} bytes and not in git — the full handoff is still on disk at \`${keepPath}\`. Read it now, then delete that file yourself. -->\n`,
+    text: `${cut}\n<!-- TRUNCATED: ${bytes} bytes — the full handoff is still on disk at \`${keepPath}\`. Read it now, then delete that file yourself. -->\n`,
     keepFile: true,
   };
-}
-
-/** Trim the handoff markdown to MD_LIMIT_BYTES with a pointer to the full text. */
-function truncateMarkdown(mdText, gitRef, relPath) {
-  if (Buffer.byteLength(mdText, 'utf8') <= MD_LIMIT_BYTES) return mdText;
-  const cut = Buffer.from(mdText, 'utf8').subarray(0, MD_LIMIT_BYTES).toString('utf8').replace(/�+$/, '');
-  return `${cut}\n<!-- TRUNCATED: full text via \`git show ${gitRef}:${relPath}\` -->\n`;
 }
 
 /** STATE.md excerpt: the frontmatter keys that matter + the head of ## Current Position. */
@@ -553,7 +543,6 @@ function main() {
   //    above moved them — `committedPair`); otherwise plain removal, no git.
   const delPaths = [rel(jsonLatest)].concat(mdLatest ? [rel(mdLatest)] : []);
   const commitMsg = `chore: [${pending.role_id}] handoff consumed by ${sid8(sid)} (gsd-resume-hook)`;
-  let recoverable = false;
   if (DRY) {
     notes.push(committedPair ? `git commit --only -m "${commitMsg}" -- ${delPaths.join(' ')}` : 'uncommitted handoff: files removed, no git');
   } else if (committedPair) {
@@ -566,7 +555,6 @@ function main() {
     }
     if (done) {
       result.commit = (git(root, ['rev-parse', '--short', 'HEAD']).stdout || '').trim();
-      recoverable = true;
       notes.push(`consumed commit ${result.commit}`);
     } else {
       notes.push(`★ consumed commit failed (${err.split('\n')[0]}) — stage/commit the deletions yourself: ${delPaths.join(' ')}`);
@@ -593,18 +581,13 @@ function main() {
   // 5. injected context
   let stateText = '';
   try { stateText = fs.readFileSync(path.join(planningDir, 'STATE.md'), 'utf8'); } catch (e) { stateText = ''; }
-  const injected = injectableMarkdown(mdText, {
-    recoverable,
-    gitRef: result.commit ? `${result.commit}^` : 'HEAD',
-    relPath: mdLatest ? rel(mdLatest) : '?',
-    keepPath: mdClaimed ? rel(mdClaimed) : '?',
-  });
+  const injected = injectableMarkdown(mdText, { keepPath: mdClaimed ? rel(mdClaimed) : '?' });
   const mdBody = injected.text;
   if (!DRY) {
     // session-resume already removed the claimed JSON; remove it ourselves only when it did not.
     if (!sessionResumed) { try { fs.unlinkSync(jsonClaimed); } catch (e) { /* gone */ } }
     if (mdClaimed && !injected.keepFile) { try { fs.unlinkSync(mdClaimed); } catch (e) { /* gone */ } }
-    if (mdClaimed && injected.keepFile) notes.push(`★ handoff markdown kept on disk (${rel(mdClaimed)}) — too large to inject and not in git`);
+    if (mdClaimed && injected.keepFile) notes.push(`★ handoff markdown kept on disk (${rel(mdClaimed)}) — too large to inject in full`);
     result.claimed = injected.keepFile && mdClaimed ? rel(mdClaimed) : null;
   }
   const head = [
@@ -645,6 +628,6 @@ if (require.main === module) {
 
 module.exports = {
   DEFAULT_PENDING_FILE, PENDING_MAX_AGE_MS, MD_LIMIT_BYTES, MD_FULL_LIMIT_BYTES, AUTOPAUSE_DEFAULTS,
-  readAutopauseConfig, resolvePendingPath, commitDocsEnabled, injectableMarkdown, decideSkipReason, truncateMarkdown, stateExcerpt, listingLine, findLatestContinueHere, resumeAction,
+  readAutopauseConfig, resolvePendingPath, commitDocsEnabled, injectableMarkdown, decideSkipReason, stateExcerpt, listingLine, findLatestContinueHere, resumeAction,
   trimContextOutput, CONTEXT_LIMIT_BYTES,
 };

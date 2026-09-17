@@ -38,9 +38,9 @@ watcher                                  gsd-resume-hook.js (SessionStart, sourc
                                          8. consume: commit_docs on ∧ both files tracked+clean →
                                             git commit --only (the two .latest deletions);
                                             otherwise remove the files, no git call
-                                         9. additionalContext: handoff markdown — full text (≤ 32 KB)
-                                            unless git holds it (then ≤ 8 KB + `git show` pointer);
-                                            over 32 KB the claimed MD stays on disk to Read — + STATE.md excerpt
+                                         9. additionalContext: handoff markdown in full (≤ 32 KB);
+                                            over that, 8 KB + the claimed MD stays on disk to Read
+                                            (size only — git plays no part) + STATE.md excerpt
                                             + "start from <next_action>, do not run /gsd-resume-work"
 10. sees <resumed file>            ◄───  10. writes resumed.json next to the pending file
 ```

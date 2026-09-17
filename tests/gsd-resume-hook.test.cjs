@@ -61,14 +61,13 @@ describe('pure pieces', () => {
     assert.match(hook.decideSkipReason({ source: 'clear' }, fresh, now, 'OLD'), /unchanged/);
   });
 
-  test('truncateMarkdown keeps ≤ 8 KB verbatim and points at git show beyond it', () => {
-    const small = 'x'.repeat(100);
-    assert.equal(hook.truncateMarkdown(small, 'abc^', 'p.md'), small);
-    const big = 'あ'.repeat(5000); // 15 KB in UTF-8
-    const out = hook.truncateMarkdown(big, 'abc^', '.planning/x.md');
-    assert.ok(Buffer.byteLength(out, 'utf8') < 8 * 1024 + 200);
-    assert.match(out, /<!-- TRUNCATED: full text via `git show abc\^:\.planning\/x\.md` -->/);
-    assert.ok(!out.includes('�'), 'no split multibyte char at the cut');
+  test('injectableMarkdown: by size only — full ≤ 32 KB, else 8 KB head + keep the file; multibyte-safe cut', () => {
+    const big = 'あ'.repeat(12000); // 36 KB in UTF-8
+    const out = hook.injectableMarkdown(big, { keepPath: '.planning/x.md' });
+    assert.equal(out.keepFile, true);
+    assert.ok(Buffer.byteLength(out.text, 'utf8') < 8 * 1024 + 300);
+    assert.match(out.text, /<!-- TRUNCATED: \d+ bytes — the full handoff is still on disk at `\.planning\/x\.md`/);
+    assert.ok(!out.text.includes('�'), 'no split multibyte char at the cut');
   });
 
   test('stateExcerpt: frontmatter keys + first 40 lines of ## Current Position', () => {
@@ -389,14 +388,10 @@ describe('end to end (scratch git project)', () => {
 
   test('injectableMarkdown / commitDocsEnabled', (t) => {
     const small = 'x'.repeat(100);
-    assert.deepEqual(hook.injectableMarkdown(small, { recoverable: false, gitRef: 'r', relPath: 'p', keepPath: 'k' }), { text: small, keepFile: false });
+    assert.deepEqual(hook.injectableMarkdown(small, { keepPath: 'k' }), { text: small, keepFile: false });
     const mid = 'y'.repeat(20 * 1024);
-    assert.deepEqual(hook.injectableMarkdown(mid, { recoverable: false, gitRef: 'r', relPath: 'p', keepPath: 'k' }), { text: mid, keepFile: false }, 'full text when git cannot return it');
-    const rec = hook.injectableMarkdown(mid, { recoverable: true, gitRef: 'abc^', relPath: '.planning/x.md', keepPath: 'k' });
-    assert.equal(rec.keepFile, false);
-    assert.ok(Buffer.byteLength(rec.text, 'utf8') < 9 * 1024);
-    assert.match(rec.text, /git show abc\^:\.planning\/x\.md/);
-    const huge = hook.injectableMarkdown('z'.repeat(40 * 1024), { recoverable: false, gitRef: 'r', relPath: 'p', keepPath: '.planning/HANDOFF.claimed.md' });
+    assert.deepEqual(hook.injectableMarkdown(mid, { keepPath: 'k' }), { text: mid, keepFile: false }, 'full text between 8 and 32 KB, git or not');
+    const huge = hook.injectableMarkdown('z'.repeat(40 * 1024), { keepPath: '.planning/HANDOFF.claimed.md' });
     assert.equal(huge.keepFile, true);
     assert.match(huge.text, /Read it now, then delete that file yourself/);
     assert.match(huge.text, /\.planning\/HANDOFF\.claimed\.md/);
