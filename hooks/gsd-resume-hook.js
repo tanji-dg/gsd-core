@@ -25,15 +25,23 @@
 //      deletion of the claimed JSON — the same contract resume-project.md uses).
 //      NOTE: `--raw` prints only `true`; the JSON output is parsed and success
 //      is exit 0 ∧ resumed:true (stderr warnings are not failures)
-//   4. commits ONLY the two `.latest.*` deletions with `git commit --only` (a
-//      temporary index — other sessions' staged work is untouched), then
-//      unlinks the claimed markdown (its content is in the pause WIP commit)
+//   4. consumes the two `.latest.*` files. Committing is NOT a precondition of
+//      this capability — GSD's own `commit_docs: false` (or an ignored
+//      .planning/) means pause-work never commits, and a WIP commit can fail —
+//      so: when commit_docs is on AND both files are tracked and clean, the
+//      deletions are committed with `git commit --only` (a temporary index —
+//      other sessions' staged work is untouched); otherwise the files are just
+//      removed and the record says "uncommitted handoff consumed; content is
+//      only in the injected text". No git call is made on the latter path.
 //   4b. runs the project's `autopause.context_command` and appends its
 //      stdout (≤ 4 KB) as "### Project context" — the extension point for
 //      per-role lines the project keeps outside the handoff (e.g. a
 //      coordinator's notes to a successor in STATE.md ## Session Continuity)
-//   5. injects, as additionalContext: the handoff markdown (over 8 KB → the
-//      first 8 KB + <!-- TRUNCATED --> + a `git show` pointer), a STATE.md
+//   5. injects, as additionalContext: the handoff markdown — the FULL text
+//      (up to 32 KB) when git cannot give it back, the first 8 KB + a
+//      `git show` pointer only when the consumed commit's parent holds it;
+//      over 32 KB the claimed markdown is left on disk and the text says
+//      "Read <path> and delete it" — a handoff is never lost —, a STATE.md
 //      excerpt (frontmatter keys + the first 40 lines of ## Current Position)
 //      and three lines of instructions — so /gsd-resume-work is NOT needed
 //   6. writes a RESUMED file next to the pending file (the watcher's ack)
@@ -84,6 +92,9 @@ const AUTOPAUSE_DEFAULTS = Object.freeze({
 });
 const PENDING_MAX_AGE_MS = 30 * 60 * 1000;
 const MD_LIMIT_BYTES = 8 * 1024;
+// Injected in full when git cannot return the text; beyond this the claimed
+// markdown stays on disk for the session to Read.
+const MD_FULL_LIMIT_BYTES = 32 * 1024;
 const POSITION_LINES = 40;
 const CLAIM_COMMAND_TIMEOUT_MS = 30000;
 const CONTEXT_COMMAND_TIMEOUT_MS = 10000;
@@ -181,6 +192,47 @@ function decideSkipReason(input, pending, nowMs, sid) {
   if (!(age >= 0 && age < PENDING_MAX_AGE_MS)) return `pending is stale (${pending.at || '?'})`;
   if (pending.old_sid && sid && pending.old_sid === sid) return 'session id unchanged';
   return null;
+}
+
+/**
+ * Does this project commit its planning docs? GSD's own switch:
+ * `commit_docs: false` / `planning.commit_docs: false`, or a .gitignored
+ * .planning/ (checked only when a repository exists). Off → no git call at all
+ * in the consume/inject paths.
+ */
+function commitDocsEnabled(root, config) {
+  const cfg = config === undefined ? (readJson(path.join(root, '.planning', 'config.json')) || {}) : (config || {});
+  if (cfg.commit_docs === false) return false;
+  if (cfg.planning && typeof cfg.planning === 'object' && cfg.planning.commit_docs === false) return false;
+  if (!fs.existsSync(path.join(root, '.git'))) return false;
+  const r = spawnSync('git', ['-C', root, 'check-ignore', '-q', '--no-index', '--', '.planning'], { stdio: 'ignore', timeout: 15000 });
+  return r.status !== 0;
+}
+
+/** Is `rel` tracked and unmodified? Only asked when commit_docs is on. */
+function trackedAndClean(root, rel) {
+  const a = spawnSync('git', ['-C', root, 'ls-files', '--error-unmatch', '--', rel], { stdio: 'ignore', timeout: 15000 });
+  if (a.status !== 0) return false;
+  const b = spawnSync('git', ['-C', root, 'diff', '--quiet', 'HEAD', '--', rel], { stdio: 'ignore', timeout: 15000 });
+  return b.status === 0;
+}
+
+/**
+ * The markdown as injected. `recoverable` = git holds the full text (the
+ * consumed commit's parent) → the classic 8 KB cut with a `git show` pointer.
+ * Otherwise the full text up to MD_FULL_LIMIT_BYTES; beyond that the first
+ * 8 KB plus an instruction to Read `keepPath` (left on disk) and delete it.
+ * Returns { text, keepFile } — keepFile true when the claimed MD must stay.
+ */
+function injectableMarkdown(mdText, { recoverable, gitRef, relPath, keepPath }) {
+  const bytes = Buffer.byteLength(mdText, 'utf8');
+  if (recoverable) return { text: truncateMarkdown(mdText, gitRef, relPath), keepFile: false };
+  if (bytes <= MD_FULL_LIMIT_BYTES) return { text: mdText, keepFile: false };
+  const cut = Buffer.from(mdText, 'utf8').subarray(0, MD_LIMIT_BYTES).toString('utf8').replace(/�+$/, '');
+  return {
+    text: `${cut}\n<!-- TRUNCATED: ${bytes} bytes and not in git — the full handoff is still on disk at \`${keepPath}\`. Read it now, then delete that file yourself. -->\n`,
+    keepFile: true,
+  };
 }
 
 /** Trim the handoff markdown to MD_LIMIT_BYTES with a pointer to the full text. */
@@ -433,6 +485,12 @@ function main() {
   const handoffJson = readJson(jsonLatest) || {};
   let mdText = '';
   try { mdText = mdLatest ? fs.readFileSync(mdLatest, 'utf8') : ''; } catch (e) { mdText = ''; }
+  // Before the rename: are these files something git can give back? Only
+  // asked when the project commits its docs at all.
+  const docsCommitted = commitDocsEnabled(root, config);
+  const committedPair = docsCommitted
+    && trackedAndClean(root, rel(jsonLatest))
+    && (!mdLatest || trackedAndClean(root, rel(mdLatest)));
   if (DRY) {
     notes.push(`mv ${rel(jsonLatest)} → ${rel(jsonClaimed)}`);
     notes.push(mdLatest ? `mv ${rel(mdLatest)} → ${rel(mdClaimed)}` : `★ .continue-here.latest.${pending.role_id}.md not found`);
@@ -490,12 +548,15 @@ function main() {
     notes.push('★ gsd-tools.cjs not found → state session-resume skipped, unlinking the claimed JSON directly');
   }
 
-  // 4. commit only the two .latest deletions; then drop the claimed twins
+  // 4. consume the two .latest files. Committed only when the project commits
+  //    its docs AND both files were tracked + clean (decided BEFORE the rename
+  //    above moved them — `committedPair`); otherwise plain removal, no git.
   const delPaths = [rel(jsonLatest)].concat(mdLatest ? [rel(mdLatest)] : []);
   const commitMsg = `chore: [${pending.role_id}] handoff consumed by ${sid8(sid)} (gsd-resume-hook)`;
+  let recoverable = false;
   if (DRY) {
-    notes.push(`git commit --only -m "${commitMsg}" -- ${delPaths.join(' ')}`);
-  } else {
+    notes.push(committedPair ? `git commit --only -m "${commitMsg}" -- ${delPaths.join(' ')}` : 'uncommitted handoff: files removed, no git');
+  } else if (committedPair) {
     let done = false;
     let err = '';
     for (let i = 0; i < COMMIT_RETRIES && !done; i++) {
@@ -505,15 +566,14 @@ function main() {
     }
     if (done) {
       result.commit = (git(root, ['rev-parse', '--short', 'HEAD']).stdout || '').trim();
+      recoverable = true;
       notes.push(`consumed commit ${result.commit}`);
     } else {
       notes.push(`★ consumed commit failed (${err.split('\n')[0]}) — stage/commit the deletions yourself: ${delPaths.join(' ')}`);
       log(`commit FAIL: ${err.replace(/\n/g, ' | ')}`);
     }
-    // session-resume already removed the claimed JSON; remove it ourselves only when it did not.
-    if (!sessionResumed) { try { fs.unlinkSync(jsonClaimed); } catch (e) { /* gone */ } }
-    if (mdClaimed) { try { fs.unlinkSync(mdClaimed); } catch (e) { /* gone */ } }
-    result.claimed = null;
+  } else {
+    notes.push(`uncommitted handoff consumed (${docsCommitted ? 'files were not tracked+clean' : 'commit_docs is off'}); content is only in the injected text`);
   }
 
   // 4b. project context (per-role lines the project keeps outside the handoff)
@@ -533,11 +593,24 @@ function main() {
   // 5. injected context
   let stateText = '';
   try { stateText = fs.readFileSync(path.join(planningDir, 'STATE.md'), 'utf8'); } catch (e) { stateText = ''; }
-  const mdBody = truncateMarkdown(mdText, result.commit ? `${result.commit}^` : 'HEAD', mdLatest ? rel(mdLatest) : '?');
+  const injected = injectableMarkdown(mdText, {
+    recoverable,
+    gitRef: result.commit ? `${result.commit}^` : 'HEAD',
+    relPath: mdLatest ? rel(mdLatest) : '?',
+    keepPath: mdClaimed ? rel(mdClaimed) : '?',
+  });
+  const mdBody = injected.text;
+  if (!DRY) {
+    // session-resume already removed the claimed JSON; remove it ourselves only when it did not.
+    if (!sessionResumed) { try { fs.unlinkSync(jsonClaimed); } catch (e) { /* gone */ } }
+    if (mdClaimed && !injected.keepFile) { try { fs.unlinkSync(mdClaimed); } catch (e) { /* gone */ } }
+    if (mdClaimed && injected.keepFile) notes.push(`★ handoff markdown kept on disk (${rel(mdClaimed)}) — too large to inject and not in git`);
+    result.claimed = injected.keepFile && mdClaimed ? rel(mdClaimed) : null;
+  }
   const head = [
     `# Automatic resume (gsd-resume-hook) — role: ${pending.role || pending.role_id}  previous session ${sid8(pending.old_sid)} → ${sid8(sid)}`,
     '',
-    '- The handoff claim, `state session-resume` and the consumed commit are **done** (record below). **Do not run `/gsd-resume-work`.**',
+    '- The handoff claim, `state session-resume` and the removal of the handoff files are **done** (record below). **Do not run `/gsd-resume-work`.**',
     '- **Start from `<next_action>`.** The handoff markdown is the primary source; Read STATE.md `### Decisions` / `### Blockers/Concerns` / `## Session Continuity` and PROJECT.md only when the work needs them.',
     `- \`next_action\`: ${handoffJson.next_action || '(not in the JSON)'}`,
     `- record: ${notes.join(' / ')}`,
@@ -571,7 +644,7 @@ if (require.main === module) {
 }
 
 module.exports = {
-  DEFAULT_PENDING_FILE, PENDING_MAX_AGE_MS, MD_LIMIT_BYTES, AUTOPAUSE_DEFAULTS,
-  readAutopauseConfig, resolvePendingPath, decideSkipReason, truncateMarkdown, stateExcerpt, listingLine, findLatestContinueHere, resumeAction,
+  DEFAULT_PENDING_FILE, PENDING_MAX_AGE_MS, MD_LIMIT_BYTES, MD_FULL_LIMIT_BYTES, AUTOPAUSE_DEFAULTS,
+  readAutopauseConfig, resolvePendingPath, commitDocsEnabled, injectableMarkdown, decideSkipReason, truncateMarkdown, stateExcerpt, listingLine, findLatestContinueHere, resumeAction,
   trimContextOutput, CONTEXT_LIMIT_BYTES,
 };

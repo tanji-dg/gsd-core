@@ -387,6 +387,101 @@ describe('end to end (scratch git project)', () => {
     assert.match(r.context, /★ context_command failed \(rc=2\) — nothing appended/);
   });
 
+  test('injectableMarkdown / commitDocsEnabled', (t) => {
+    const small = 'x'.repeat(100);
+    assert.deepEqual(hook.injectableMarkdown(small, { recoverable: false, gitRef: 'r', relPath: 'p', keepPath: 'k' }), { text: small, keepFile: false });
+    const mid = 'y'.repeat(20 * 1024);
+    assert.deepEqual(hook.injectableMarkdown(mid, { recoverable: false, gitRef: 'r', relPath: 'p', keepPath: 'k' }), { text: mid, keepFile: false }, 'full text when git cannot return it');
+    const rec = hook.injectableMarkdown(mid, { recoverable: true, gitRef: 'abc^', relPath: '.planning/x.md', keepPath: 'k' });
+    assert.equal(rec.keepFile, false);
+    assert.ok(Buffer.byteLength(rec.text, 'utf8') < 9 * 1024);
+    assert.match(rec.text, /git show abc\^:\.planning\/x\.md/);
+    const huge = hook.injectableMarkdown('z'.repeat(40 * 1024), { recoverable: false, gitRef: 'r', relPath: 'p', keepPath: '.planning/HANDOFF.claimed.md' });
+    assert.equal(huge.keepFile, true);
+    assert.match(huge.text, /Read it now, then delete that file yourself/);
+    assert.match(huge.text, /\.planning\/HANDOFF\.claimed\.md/);
+
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'gsd-resume-hook-cd-'));
+    t.after(() => cleanup(dir));
+    fs.mkdirSync(path.join(dir, '.planning'), { recursive: true });
+    assert.equal(hook.commitDocsEnabled(dir, {}), false, 'no repository → off');
+    gitOrThrow(['init', '-q', '.'], { cwd: dir });
+    assert.equal(hook.commitDocsEnabled(dir, {}), true);
+    assert.equal(hook.commitDocsEnabled(dir, { commit_docs: false }), false);
+    assert.equal(hook.commitDocsEnabled(dir, { planning: { commit_docs: false } }), false);
+    fs.writeFileSync(path.join(dir, '.gitignore'), '.planning/\n');
+    assert.equal(hook.commitDocsEnabled(dir, {}), false, 'ignored .planning/ → off');
+  });
+
+  test('commit_docs: false (ignored .planning/) → consume by removal only, full text injected, no consumed commit', (t) => {
+    const { dir, cfg } = makeProject(t);
+    fs.writeFileSync(path.join(dir, '.gitignore'), '.planning/\n');
+    gitOrThrow(['rm', '-r', '-q', '--cached', '.planning'], { cwd: dir });
+    gitOrThrow(['commit', '-q', '-am', 'stop tracking .planning'], { cwd: dir });
+    const cfgPath = path.join(dir, '.planning', 'config.json');
+    const c = JSON.parse(fs.readFileSync(cfgPath, 'utf8'));
+    c.commit_docs = false;
+    fs.writeFileSync(cfgPath, JSON.stringify(c));
+    const longMd = `# handoff\n\n${'line of context\n'.repeat(700)}<next_action>\nStart with: task 3\n</next_action>\n`; // ~11 KB, over the 8 KB cut
+    fs.writeFileSync(path.join(dir, '.planning', 'phases', '02-x', '.continue-here.latest.coordinator.md'), longMd);
+    const before = gitOrThrow(['rev-parse', 'HEAD'], { cwd: dir }).trim();
+    writePending(dir);
+    fs.writeFileSync(path.join(cfg, 'sessions', '99999999.json'), JSON.stringify({ sessionId: 'NEW' }));
+    const r = run(dir, cfg, { session_id: 'NEW', source: 'clear' });
+    assert.equal(r.exitCode, 0, r.stderr);
+    assert.match(r.context, /^# Automatic resume/);
+    assert.match(r.context, /uncommitted handoff consumed \(commit_docs is off\); content is only in the injected text/);
+    assert.doesNotMatch(r.context, /consumed commit [0-9a-f]/);
+    assert.doesNotMatch(r.context, /TRUNCATED/);
+    assert.ok(r.context.includes(longMd.trim()), 'full markdown injected');
+    assert.equal(gitOrThrow(['rev-parse', 'HEAD'], { cwd: dir }).trim(), before, 'no commit made');
+    const planning = path.join(dir, '.planning');
+    assert.deepEqual(fs.readdirSync(planning).filter((n) => n.startsWith('HANDOFF')), ['HANDOFF.latest.design.json']);
+    assert.deepEqual(fs.readdirSync(path.join(planning, 'phases', '02-x')), []);
+    assert.equal(JSON.parse(fs.readFileSync(path.join(dir, '.claude', 'gsd-resume', 'resumed.json'), 'utf8')).commit, null);
+  });
+
+  test('untracked handoff in a committing project → removal only; over 32 KB the claimed markdown stays on disk', (t) => {
+    const { dir, cfg } = makeProject(t);
+    // overwrite the committed twin with a huge, uncommitted one
+    const huge = `# handoff\n\n${'0123456789abcdef'.repeat(2200)}\n`; // ~35 KB
+    fs.writeFileSync(path.join(dir, '.planning', 'phases', '02-x', '.continue-here.latest.coordinator.md'), huge);
+    const before = gitOrThrow(['rev-parse', 'HEAD'], { cwd: dir }).trim();
+    writePending(dir);
+    fs.writeFileSync(path.join(cfg, 'sessions', '99999999.json'), JSON.stringify({ sessionId: 'NEW' }));
+    const r = run(dir, cfg, { session_id: 'NEW', source: 'clear' });
+    assert.equal(r.exitCode, 0, r.stderr);
+    assert.match(r.context, /uncommitted handoff consumed \(files were not tracked\+clean\)/);
+    assert.match(r.context, /Read it now, then delete that file yourself/);
+    assert.match(r.context, /★ handoff markdown kept on disk \(\.planning\/phases\/02-x\/\.continue-here\.claimed\.coordinator\.NEW\.md\)/);
+    assert.equal(gitOrThrow(['rev-parse', 'HEAD'], { cwd: dir }).trim(), before, 'no commit made');
+    assert.ok(fs.existsSync(path.join(dir, '.planning', 'phases', '02-x', '.continue-here.claimed.coordinator.NEW.md')), 'kept for the session to Read');
+    assert.ok(!fs.existsSync(path.join(dir, '.planning', 'phases', '02-x', '.continue-here.latest.coordinator.md')));
+    assert.equal(JSON.parse(fs.readFileSync(path.join(dir, '.claude', 'gsd-resume', 'resumed.json'), 'utf8')).claimed, '.planning/phases/02-x/.continue-here.claimed.coordinator.NEW.md');
+  });
+
+  test('no git at all → the whole resume still works (removal only)', (t) => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'gsd-resume-hook-nogit-'));
+    t.after(() => cleanup(dir));
+    const cfg = fs.mkdtempSync(path.join(os.tmpdir(), 'gsd-resume-hook-cfg-'));
+    t.after(() => cleanup(cfg));
+    fs.mkdirSync(path.join(dir, '.planning', 'phases', '02-x'), { recursive: true });
+    fs.mkdirSync(path.join(cfg, 'sessions'), { recursive: true });
+    fs.writeFileSync(path.join(dir, '.planning', 'STATE.md'), '---\nstatus: executing\n---\n\n## Current Position\n\n**Status:** Executing Phase 2\n');
+    fs.writeFileSync(path.join(dir, '.planning', 'config.json'), JSON.stringify({ autopause: { enabled: true } }));
+    fs.writeFileSync(path.join(dir, '.planning', 'HANDOFF.latest.coordinator.json'), JSON.stringify({ session_id: 'OLD', role_id: 'coordinator', phase_dir: '.planning/phases/02-x', next_action: 'go' }));
+    fs.writeFileSync(path.join(dir, '.planning', 'phases', '02-x', '.continue-here.latest.coordinator.md'), '# h\n');
+    writePending(dir);
+    fs.writeFileSync(path.join(cfg, 'sessions', '99999999.json'), JSON.stringify({ sessionId: 'NEW' }));
+    const r = run(dir, cfg, { session_id: 'NEW', source: 'clear' });
+    assert.equal(r.exitCode, 0, r.stderr);
+    assert.match(r.context, /^# Automatic resume/);
+    assert.match(r.context, /uncommitted handoff consumed \(commit_docs is off\)/);
+    assert.match(r.context, /state session-resume: .*record=\.planning\/sessions\/NEW\.json/);
+    assert.deepEqual(fs.readdirSync(path.join(dir, '.planning')).filter((n) => n.startsWith('HANDOFF')), []);
+    assert.deepEqual(fs.readdirSync(path.join(dir, '.planning', 'phases', '02-x')), []);
+  });
+
   test('autopause.enabled false → listing only, even with a pending record addressed to us', (t) => {
     const { dir, cfg } = makeProject(t);
     fs.writeFileSync(path.join(dir, '.planning', 'config.json'), JSON.stringify({ autopause: { enabled: false } }));
