@@ -1,6 +1,10 @@
 #!/usr/bin/env node
 // gsd-hook-version: {{GSD_VERSION}}
-// Resume hook - SessionStart(matcher: clear) hook.
+// Resume hook - SessionStart(matcher: clear) hook. Part of the `autopause`
+// capability (capabilities/autopause/capability.json): every setting below is
+// an `autopause.*` config key and the automatic path runs only when
+// `autopause.enabled` is true — otherwise the hook only lists unclaimed
+// handoffs (safe without opt-in).
 //
 // Machinises the resume-project.md `check_incomplete_work` claim +
 // `update_session` steps for the unattended "pause → /clear → resume" cycle:
@@ -13,7 +17,7 @@
 //   1. claims the role-keyed handoff — HANDOFF.latest.<role_id>.json →
 //      HANDOFF.claimed.<role_id>.<sid>.json and .continue-here.latest.<role_id>.md
 //      → .continue-here.claimed.<role_id>.<sid>.md (rename, atomic)
-//   2. runs the project's `hooks.resume_claim_command` (extension point: role
+//   2. runs the project's `autopause.claim_command` (extension point: role
 //      registry registration, milestone.lock re-keying, … — nothing project-
 //      specific lives here)
 //   3. runs `gsd-tools state session-resume --session --role --role-id
@@ -24,6 +28,10 @@
 //   4. commits ONLY the two `.latest.*` deletions with `git commit --only` (a
 //      temporary index — other sessions' staged work is untouched), then
 //      unlinks the claimed markdown (its content is in the pause WIP commit)
+//   4b. runs the project's `autopause.context_command` and appends its
+//      stdout (≤ 4 KB) as "### Project context" — the extension point for
+//      per-role lines the project keeps outside the handoff (e.g. a
+//      coordinator's notes to a successor in STATE.md ## Session Continuity)
 //   5. injects, as additionalContext: the handoff markdown (over 8 KB → the
 //      first 8 KB + <!-- TRUNCATED --> + a `git show` pointer), a STATE.md
 //      excerpt (frontmatter keys + the first 40 lines of ## Current Position)
@@ -40,7 +48,7 @@
 //   ∧  pending.old_sid != our session id
 //
 // Pending file (written by the watcher; path from .planning/config.json
-// `hooks.resume_pending_file`, default `.claude/gsd-resume/pending.json`):
+// `autopause.pending_file`, default `.claude/gsd-resume/pending.json`):
 //   { version: 1, at: ISO, claude_pid, old_sid, role, role_id,
 //     handoff_json_path?, handoff_md_path?, only_clear? }
 // Resumed file: sibling `resumed.json` — { at, old_sid, new_sid, role_id, role,
@@ -59,10 +67,27 @@ const { HOOK_ON_CRASH, allow, crash } = require('./lib/hook-exit.js');
 const ON_CRASH = HOOK_ON_CRASH.ALLOW;
 
 const DEFAULT_PENDING_FILE = '.claude/gsd-resume/pending.json';
+
+/**
+ * Registry defaults of the autopause.* keys (capabilities/autopause/capability.json)
+ * — mirrored here so a hook needs no registry load per turn. threshold_used_pct
+ * is intentionally absent: when unset it is DERIVED (100 − hooks.context_warning_threshold).
+ */
+const AUTOPAUSE_DEFAULTS = Object.freeze({
+  enabled: false,
+  guard_command: '',
+  clear_command: '',
+  pending_file: DEFAULT_PENDING_FILE,
+  claim_command: '',
+  context_command: '',
+  notify_command: '',
+});
 const PENDING_MAX_AGE_MS = 30 * 60 * 1000;
 const MD_LIMIT_BYTES = 8 * 1024;
 const POSITION_LINES = 40;
 const CLAIM_COMMAND_TIMEOUT_MS = 30000;
+const CONTEXT_COMMAND_TIMEOUT_MS = 10000;
+const CONTEXT_LIMIT_BYTES = 4 * 1024;
 const SESSION_RESUME_TIMEOUT_MS = 30000;
 const COMMIT_RETRIES = 3;
 const COMMIT_RETRY_MS = 2000;
@@ -114,13 +139,33 @@ function sleepMs(ms) {
 // ---------------------------------------------------------------------------
 
 /**
+ * The effective autopause.* settings for a project: the raw root
+ * `.planning/config.json` `autopause` block over AUTOPAUSE_DEFAULTS. Only the
+ * capability's own keys are read — the pre-capability `hooks.resume_*` /
+ * `hooks.pause_*` spellings are NOT consulted (one config surface, not two).
+ * Fail-soft: an unreadable config is the defaults (enabled: false).
+ */
+function readAutopauseConfig(root, config) {
+  const cfg = config === undefined ? (readJson(path.join(root, '.planning', 'config.json')) || {}) : (config || {});
+  const raw = cfg && cfg.autopause && typeof cfg.autopause === 'object' ? cfg.autopause : {};
+  const out = Object.assign({}, AUTOPAUSE_DEFAULTS);
+  for (const key of Object.keys(AUTOPAUSE_DEFAULTS)) {
+    if (raw[key] === undefined || raw[key] === null) continue;
+    if (key === 'enabled') out.enabled = raw[key] === true;
+    else if (typeof raw[key] === 'string') out[key] = raw[key].trim();
+  }
+  out.threshold_used_pct = Number.isFinite(Number(raw.threshold_used_pct)) ? Number(raw.threshold_used_pct) : undefined;
+  return out;
+}
+
+/**
  * Resolve the pending-file location from `.planning/config.json`
- * (`hooks.resume_pending_file`, relative to the project root). Always inside
+ * (`autopause.pending_file`, relative to the project root). Always inside
  * the project: an absolute or traversing value falls back to the default.
  */
 function resolvePendingPath(root, config) {
   let rel = DEFAULT_PENDING_FILE;
-  const v = config && config.hooks && config.hooks.resume_pending_file;
+  const v = readAutopauseConfig(root, config).pending_file;
   if (typeof v === 'string' && v.trim()) rel = v.trim();
   const abs = path.resolve(root, rel);
   const inside = path.relative(root, abs);
@@ -277,6 +322,27 @@ function resumeAction(handoffJson) {
   return na ? na.slice(0, 120) : 'next action';
 }
 
+/**
+ * Trim a command's stdout for injection: ≤ CONTEXT_LIMIT_BYTES, else the
+ * first 4 KB + a TRUNCATED marker. Empty/whitespace → ''.
+ */
+function trimContextOutput(text) {
+  const body = String(text || '').replace(/\r\n/g, '\n').trim();
+  if (!body) return '';
+  if (Buffer.byteLength(body, 'utf8') <= CONTEXT_LIMIT_BYTES) return body;
+  const cut = Buffer.from(body, 'utf8').subarray(0, CONTEXT_LIMIT_BYTES).toString('utf8').replace(/�+$/, '');
+  return `${cut}\n<!-- TRUNCATED -->`;
+}
+
+function runContextCommand(cmd, root, env) {
+  const r = spawnSync(cmd, { cwd: root, shell: true, encoding: 'utf8', timeout: CONTEXT_COMMAND_TIMEOUT_MS, env });
+  if (r.error || r.status !== 0) {
+    const why = r.error ? (r.error.code === 'ETIMEDOUT' ? 'timeout' : r.error.message) : `rc=${r.status}`;
+    return { ok: false, why, text: '' };
+  }
+  return { ok: true, why: '', text: trimContextOutput(r.stdout) };
+}
+
 function runClaimCommand(cmd, root, env) {
   const r = spawnSync(cmd, { cwd: root, shell: true, encoding: 'utf8', timeout: CLAIM_COMMAND_TIMEOUT_MS, env });
   const out = ((r.stdout || '') + (r.stderr || '')).trim().split('\n')[0] || '';
@@ -300,10 +366,19 @@ function main() {
   const planningDir = path.join(root, '.planning');
   const sid = input.session_id || process.env.CLAUDE_CODE_SESSION_ID || '';
   const config = readJson(path.join(planningDir, 'config.json')) || {};
+  const autopause = readAutopauseConfig(root, config);
   const pendingPath = resolvePendingPath(root, config);
   const resumedPath = path.join(path.dirname(pendingPath), 'resumed.json');
   const log = makeLogger(path.join(path.dirname(pendingPath), 'gsd-resume-hook.log'));
   const rel = (p) => toPosix(path.relative(root, p));
+
+  // Capability gate: without autopause.enabled the only output is the
+  // unclaimed-handoff listing (no claim, no commit, nothing written).
+  if (!autopause.enabled) {
+    const l = listingLine(planningDir, 'autopause.enabled is false');
+    if (l) emit(l);
+    allow(undefined);
+  }
 
   const pending = readJson(pendingPath);
   const skip = decideSkipReason(input, pending, Date.now(), sid);
@@ -373,7 +448,7 @@ function main() {
   }
 
   // 2. project extension point (role registry, milestone.lock, …)
-  const claimCmd = config.hooks && typeof config.hooks.resume_claim_command === 'string' ? config.hooks.resume_claim_command.trim() : '';
+  const claimCmd = autopause.claim_command;
   const hookEnv = Object.assign({}, process.env, {
     CLAUDE_CODE_SESSION_ID: sid,
     GSD_RESUME_SESSION_ID: sid,
@@ -384,11 +459,11 @@ function main() {
     GSD_RESUME_HANDOFF_MD: mdLatest ? (DRY ? rel(mdLatest) : rel(mdClaimed)) : '',
   });
   if (claimCmd) {
-    if (DRY) notes.push(`resume_claim_command: ${claimCmd}`);
+    if (DRY) notes.push(`claim_command: ${claimCmd}`);
     else {
       const r = runClaimCommand(claimCmd, root, hookEnv);
-      notes.push(`${r.ok ? 'resume_claim_command ok' : '★ resume_claim_command failed'}${r.out ? ` — ${r.out}` : ''}`);
-      log(`resume_claim_command ${r.ok ? 'ok' : 'FAIL'}: ${r.out}`);
+      notes.push(`${r.ok ? 'claim_command ok' : '★ claim_command failed'}${r.out ? ` — ${r.out}` : ''}`);
+      log(`claim_command ${r.ok ? 'ok' : 'FAIL'}: ${r.out}`);
     }
   }
 
@@ -441,6 +516,20 @@ function main() {
     result.claimed = null;
   }
 
+  // 4b. project context (per-role lines the project keeps outside the handoff)
+  const contextCmd = autopause.context_command;
+  let projectContext = '';
+  if (contextCmd) {
+    const r = runContextCommand(contextCmd, root, hookEnv);
+    if (!r.ok) notes.push(`★ context_command failed (${r.why}) — nothing appended`);
+    else if (!r.text) notes.push('context_command produced no output');
+    else {
+      projectContext = r.text;
+      notes.push(`context_command: ${Buffer.byteLength(projectContext, 'utf8')} bytes appended`);
+    }
+    log(`context_command ${r.ok ? 'ok' : 'FAIL'}: ${r.ok ? `${Buffer.byteLength(r.text, 'utf8')} bytes` : r.why}`);
+  }
+
   // 5. injected context
   let stateText = '';
   try { stateText = fs.readFileSync(path.join(planningDir, 'STATE.md'), 'utf8'); } catch (e) { stateText = ''; }
@@ -454,7 +543,8 @@ function main() {
     `- record: ${notes.join(' / ')}`,
     '',
   ].join('\n');
-  const text = `${head}${stateExcerpt(stateText)}\n---\n### Handoff markdown (${mdLatest ? rel(mdLatest) : 'none'})\n\n${mdBody}`;
+  const text = `${head}${stateExcerpt(stateText)}\n---\n### Handoff markdown (${mdLatest ? rel(mdLatest) : 'none'})\n\n${mdBody}`
+    + (projectContext ? `\n---\n### Project context (autopause.context_command)\n\n${projectContext}\n` : '');
   result.ok = true;
   result.injected_bytes = Buffer.byteLength(text, 'utf8');
   if (DRY) {
@@ -475,6 +565,7 @@ if (require.main === module) {
 }
 
 module.exports = {
-  DEFAULT_PENDING_FILE, PENDING_MAX_AGE_MS, MD_LIMIT_BYTES,
-  resolvePendingPath, decideSkipReason, truncateMarkdown, stateExcerpt, listingLine, findLatestContinueHere, resumeAction,
+  DEFAULT_PENDING_FILE, PENDING_MAX_AGE_MS, MD_LIMIT_BYTES, AUTOPAUSE_DEFAULTS,
+  readAutopauseConfig, resolvePendingPath, decideSkipReason, truncateMarkdown, stateExcerpt, listingLine, findLatestContinueHere, resumeAction,
+  trimContextOutput, CONTEXT_LIMIT_BYTES,
 };

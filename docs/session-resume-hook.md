@@ -1,4 +1,11 @@
-# Session resume hook (`gsd-resume-hook.js`)
+# Autopause: the unattended pause → `/clear` → resume cycle
+
+The `autopause` capability (`capabilities/autopause/capability.json`, default
+off — `autopause.enabled`) is two host hooks and eight `autopause.*` config keys
+([CONFIGURATION.md](CONFIGURATION.md#autopause-settings)); `/gsd-autopause` is
+its operator skill. This page is the contract.
+
+## Session resume hook (`gsd-resume-hook.js`)
 
 `hooks/gsd-resume-hook.js` is a `SessionStart` hook (matcher `clear`) that
 machinises the resume half of an **unattended pause → `/clear` → resume**
@@ -24,7 +31,8 @@ watcher                                  gsd-resume-hook.js (SessionStart, sourc
 3. sends /clear                    ───►  4. pending is < 30 min old ∧ addressed to THIS
                                             Claude Code process ∧ old_sid ≠ new sid
                                          5. claim: *.latest.<role_id>.* → *.claimed.<role_id>.<sid>.*
-                                         6. hooks.resume_claim_command (project extension point)
+                                         6. autopause.claim_command (project extension point)
+                                         6b. autopause.context_command → "### Project context" (≤ 4 KB)
                                          7. gsd-tools state session-resume --session --role --role-id
                                             --handoff <claimed json>  (JSON output; exit 0 ∧ resumed:true)
                                          8. git commit --only  — the two .latest deletions only
@@ -34,7 +42,7 @@ watcher                                  gsd-resume-hook.js (SessionStart, sourc
 10. sees <resumed file>            ◄───  10. writes resumed.json next to the pending file
 ```
 
-Pending file — path from `.planning/config.json` `hooks.resume_pending_file`
+Pending file — path from `.planning/config.json` `autopause.pending_file`
 (default `.claude/gsd-resume/pending.json`, always inside the project):
 
 ```json
@@ -78,26 +86,78 @@ text; the hook never blocks the session and always exits 0.
 
 | Key (`.planning/config.json`) | Used by | Purpose |
 |---|---|---|
-| `hooks.resume_pending_file` | hook | where the watcher writes the pending record |
-| `hooks.resume_claim_command` | hook | runs after the claim, before `session-resume` — role registry registration, `milestone.lock` re-keying, anything project-specific. Env: `GSD_RESUME_SESSION_ID`, `GSD_RESUME_OLD_SESSION_ID`, `GSD_RESUME_ROLE`, `GSD_RESUME_ROLE_ID`, `GSD_RESUME_HANDOFF_JSON`, `GSD_RESUME_HANDOFF_MD`, `CLAUDE_CODE_SESSION_ID` |
-| `hooks.pause_notify_command` | pause-work `notify` step | how to reach the user when a pause ends with something only they can act on |
-| `hooks.context_warning_threshold` | watcher (recommended) | the same "remaining ≤ N %" fire-point the context monitor uses — a watcher that pauses at the WARNING point stays consistent with the agent-facing warning |
+| `autopause.pending_file` | hook | where the watcher writes the pending record |
+| `autopause.claim_command` | hook | runs after the claim, before `session-resume` — role registry registration, `milestone.lock` re-keying, anything project-specific. Env: `GSD_RESUME_SESSION_ID`, `GSD_RESUME_OLD_SESSION_ID`, `GSD_RESUME_ROLE`, `GSD_RESUME_ROLE_ID`, `GSD_RESUME_HANDOFF_JSON`, `GSD_RESUME_HANDOFF_MD`, `CLAUDE_CODE_SESSION_ID` |
+| `autopause.context_command` | hook | runs after the claim; exit 0 → stdout (≤ 4 KB, else first 4 KB + `<!-- TRUNCATED -->`) is appended as `### Project context (autopause.context_command)`. Same env as `resume_claim_command`, 10 s timeout. For the lines a role keeps outside its handoff — e.g. `grep` the role / `successor` lines out of STATE.md `## Session Continuity` — without Reading the whole file back |
+| `autopause.notify_command` | pause-work `notify` step | how to reach the user when a pause ends with something only they can act on |
+| `hooks.context_warning_threshold` | pause hook (default source) | the same "remaining ≤ N %" fire-point the context monitor uses — a watcher that pauses at the WARNING point stays consistent with the agent-facing warning |
 
 Both commands run through the platform shell (`cmd.exe` on Windows, `/bin/sh`
 elsewhere); a small Node script that reads the environment is the portable
 choice.
 
+## Pause side
+
+`hooks/gsd-pause-hook.js` is the **Stop** hook that turns the watcher's
+"decide when to pause" step into a stateless per-turn check, so a project only
+has to provide the two shell commands GSD cannot: an optional guard and the
+`/clear` sender.
+
+```
+every Stop                      gsd-pause-hook.js
+──────────                      ─────────────────
+                                used% = <tmpdir>/claude-ctx-<sid>.json (gsd-statusline.js)
+(b) our requested pause is      → spawn autopause.clear_command DETACHED (env below),
+    committed on disk             state → clear-spawned
+(a) used% ≥ threshold ∧ not     → autopause.guard_command (exit 0 = go)
+    requested (30 min TTL) ∧      → state → pause-requested
+    !stop_hook_active             → {"decision":"block","reason":"run gsd-pause-work now …"}
+otherwise                       → nothing
+```
+
+- The block reason tells the session to run `gsd-pause-work` through the WIP
+  commit, ask nothing (unknown → `unknown`) and **measure** state rather than
+  recall it.
+- (b) accepts only a handoff written for the request: `HANDOFF.latest.<role_id>.json`
+  with `session_id` == ours, committed (`git diff --quiet HEAD`), timestamp ≥
+  `requested_at − 60 s`. A **manual** pause is never cleared automatically:
+  above the threshold (a) re-requests so the handoff is rewritten from current
+  state; below it the session stays paused (logged).
+- `node gsd-pause-hook.js --request-now` (from the session's own Bash;
+  `CLAUDE_CODE_SESSION_ID`) writes `pause-requested` (`manual: true`) and
+  nothing else — run it, then `/gsd-pause-work`, and the Stop after the commit
+  takes the automatic path.
+- State/log: `state.<sid>.json` and `gsd-pause-hook.log` next to
+  `autopause.pending_file`. `stop_hook_active` (the Stop after our own
+  block) never blocks again.
+
+Threshold: `autopause.threshold_used_pct`, else `100 − hooks.context_warning_threshold`, else 65.
+Guard env: `GSD_PAUSE_SESSION_ID`, `GSD_PAUSE_CLAUDE_PID`, `GSD_PAUSE_USED_PCT`.
+Clear env: `GSD_CLEAR_SESSION_ID` (old id), `GSD_CLEAR_CLAUDE_PID`, `GSD_CLEAR_SESSION_NAME`
+(from `<CLAUDE_CONFIG_DIR>/sessions/<pid>.json`), `GSD_CLEAR_ROLE`, `GSD_CLEAR_ROLE_ID`,
+`GSD_CLEAR_HANDOFF_JSON`, `GSD_CLEAR_HANDOFF_MD`, `GSD_CLEAR_STATE_DIR` (project-relative
+POSIX). The clear command is expected to type `/clear` into the session and to
+write the pending record described above, so `gsd-resume-hook.js` can finish
+the cycle.
+
 ## Registration
 
-The plugin manifest (`hooks/hooks.json`) registers the hook under
-`SessionStart` with `"matcher": "clear"`. For a classic (non-plugin) install
-add the same entry to `settings.json` yourself — the hook is inert without a
-pending file, so registering it costs nothing:
+Both hooks read `autopause.enabled` first: off, the pause hook exits silently and the
+resume hook only prints the unclaimed-handoff listing.
+
+The plugin manifest (`hooks/hooks.json`) registers the resume hook under
+`SessionStart` with `"matcher": "clear"` and the pause hook under `Stop`.
+For a classic (non-plugin) install add the same entries to `settings.json`
+yourself — both are inert without a pending file / a threshold crossing, so
+registering them costs nothing:
 
 ```json
-{ "hooks": { "SessionStart": [ { "matcher": "clear", "hooks": [
-  { "type": "command", "command": "node \"$HOME/.claude/hooks/gsd-resume-hook.js\"", "timeout": 60 }
-] } ] } }
+{ "hooks": {
+  "SessionStart": [ { "matcher": "clear", "hooks": [
+    { "type": "command", "command": "node \"$HOME/.claude/hooks/gsd-resume-hook.js\"", "timeout": 60 } ] } ],
+  "Stop": [ { "hooks": [
+    { "type": "command", "command": "node \"$HOME/.claude/hooks/gsd-pause-hook.js\"", "timeout": 60 } ] } ]
+} }
 ```
 
 `node hooks/gsd-resume-hook.js --dry-run < input.json` prints what a real run

@@ -74,6 +74,7 @@ export const CLUSTERS: ClusterMap = Object.freeze({
   workspace_state: Object.freeze([
     'pause-work',
     'resume-work',
+    'autopause',
     'workspace',
     'workstreams',
     'thread',
