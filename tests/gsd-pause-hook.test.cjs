@@ -90,6 +90,30 @@ describe('pure pieces', () => {
     assert.match(hook.decide({ ...base, state: keep }).reason, /already requested/);
   });
 
+  test('sessionFloorMs / isHandoffToClear: newest of startedAt, spawned_at, resumed_at; fallback when unknown', () => {
+    assert.equal(hook.sessionFloorMs(null, {}), null);
+    assert.equal(hook.sessionFloorMs({ startedAt: NOW - 1000 }, {}), NOW - 1000);
+    assert.equal(hook.sessionFloorMs({ startedAt: NOW - 5000 }, { spawned_at: iso(-2000), resumed_at: iso(-3000) }), NOW - 2000);
+    assert.equal(hook.sessionFloorMs({ startedAt: null }, { resumed_at: iso(-3000) }), NOW - 3000);
+    const requested = { phase: 'pause-requested', requested_at: iso(-120000) };
+    assert.equal(hook.isHandoffToClear({ timestamp: iso(-1000) }, {}, NOW - 5000, NOW), true, 'newer than the floor, no request needed');
+    assert.equal(hook.isHandoffToClear({ timestamp: iso(-9000) }, requested, NOW - 5000, NOW), false, 'older than the floor even though requested');
+    assert.equal(hook.isHandoffToClear({ timestamp: iso(-60000) }, requested, null, NOW), true, 'unknown floor → requested-pause rule');
+    assert.equal(hook.isHandoffToClear({ timestamp: iso(-60000) }, {}, null, NOW), false, 'unknown floor, nothing requested → not cleared');
+  });
+
+  test("decide (b'): a committed handoff newer than the session clears without a request; older never; keep-session opts out; not twice", () => {
+    const base = { stopHookActive: false, state: {}, handoff: null, used: 30, threshold: 75, nowMs: NOW };
+    const fresh = { file: 'HANDOFF.latest.coordinator.json', json: { timestamp: iso(-1000) } };
+    const floor = NOW - 60000;
+    assert.equal(hook.decide({ ...base, handoff: fresh, floorMs: floor }).kind, 'spawn-clear', 'manual pause, no request');
+    assert.equal(hook.decide({ ...base, handoff: fresh, floorMs: floor, stopHookActive: true }).kind, 'spawn-clear');
+    assert.match(hook.decide({ ...base, handoff: { ...fresh, json: { timestamp: iso(-120000) } }, floorMs: floor }).reason, /manual pause on disk/);
+    assert.match(hook.decide({ ...base, handoff: fresh, floorMs: floor, state: { phase: 'keep-session', requested_at: iso(-30000) } }).reason, /keep-session/);
+    // already spawned for this handoff: spawned_at is folded into the floor by the caller
+    assert.match(hook.decide({ ...base, handoff: fresh, floorMs: NOW - 500, state: { phase: 'clear-spawned', requested_at: iso(-30000), spawned_at: iso(-500) } }).reason, /already requested/);
+  });
+
   test('blockReason carries the two unattended rules', () => {
     const r = hook.blockReason(81, 80, null);
     assert.match(r, /Do not ask the user anything/);
@@ -290,6 +314,58 @@ describe('end to end (scratch git project)', () => {
     assert.ok(!fs.existsSync(marker), 'clear-spawned → not spawned twice');
   });
 
+  function clearMarker(t, prefix) {
+    const marker = path.join(os.tmpdir(), `${prefix}-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2)}.txt`);
+    t.after(() => { try { fs.unlinkSync(marker); } catch { /* gone */ } });
+    const script = `${marker}.cjs`;
+    t.after(() => { try { fs.unlinkSync(script); } catch { /* gone */ } });
+    fs.writeFileSync(script, `require('fs').writeFileSync(${JSON.stringify(marker)}, process.env.GSD_CLEAR_SESSION_ID || '');\n`);
+    return { marker, cmd: `${JSON.stringify(process.execPath)} ${JSON.stringify(script)}` };
+  }
+
+  test("(b') manual pause (no request) committed after the session started → clear_command runs; never twice", async (t) => {
+    const { marker, cmd } = clearMarker(t, 'gsd-pause-hook-manual');
+    const { dir, cfg } = makeProject(t, { autopause: { clear_command: cmd } });
+    fs.writeFileSync(path.join(cfg, 'sessions', '4242.json'), JSON.stringify({ sessionId: 'SID', name: 'coordinator-pane', startedAt: Date.now() - 600000 }));
+    const ctx = writeCtx('SID', 30);
+    t.after(() => { try { fs.unlinkSync(ctx); } catch { /* gone */ } });
+    commitHandoff(dir, 'SID', 'coordinator', new Date().toISOString());
+    const r = run(dir, cfg, { session_id: 'SID', stop_hook_active: false });
+    assert.equal(r.exitCode, 0, r.stderr);
+    assert.equal(r.stdout.trim(), '');
+    assert.equal(readState(dir).phase, 'clear-spawned');
+    assert.match(readLog(dir), /newer than session floor .*, not requested\) → spawned/);
+    await waitFor(() => fs.existsSync(marker), { timeoutMs: PROBE_TIMEOUT_MS, message: 'clear_command did not run' });
+    assert.equal(fs.readFileSync(marker, 'utf8'), 'SID');
+    // the same handoff never clears twice: spawned_at is now the floor
+    fs.unlinkSync(marker);
+    const again = run(dir, cfg, { session_id: 'SID', stop_hook_active: true });
+    assert.equal(again.stdout.trim(), '');
+    assert.ok(!fs.existsSync(marker));
+  });
+
+  test("(b') a previous session's handoff (older than startedAt) never clears; resumed_at from the resume hook counts too", (t) => {
+    const { marker, cmd } = clearMarker(t, 'gsd-pause-hook-old');
+    const { dir, cfg } = makeProject(t, { autopause: { clear_command: cmd } });
+    fs.writeFileSync(path.join(cfg, 'sessions', '4242.json'), JSON.stringify({ sessionId: 'SID', name: 'x', startedAt: Date.now() - 60000 }));
+    const ctx = writeCtx('SID', 30);
+    t.after(() => { try { fs.unlinkSync(ctx); } catch { /* gone */ } });
+    commitHandoff(dir, 'SID', 'coordinator', new Date(Date.now() - 3600000).toISOString());
+    const r = run(dir, cfg, { session_id: 'SID', stop_hook_active: false });
+    assert.equal(r.stdout.trim(), '');
+    assert.ok(!fs.existsSync(statePath(dir)));
+    assert.match(readLog(dir), /manual pause on disk .* staying paused/);
+    assert.ok(!fs.existsSync(marker));
+    // no startedAt, but a resumed_at written by the resume hook after the handoff → still not cleared
+    fs.writeFileSync(path.join(cfg, 'sessions', '4242.json'), JSON.stringify({ sessionId: 'SID', name: 'x' }));
+    fs.mkdirSync(path.dirname(statePath(dir)), { recursive: true });
+    fs.writeFileSync(statePath(dir), JSON.stringify({ phase: 'resumed', resumed_at: new Date(Date.now() - 60000).toISOString() }));
+    const r2 = run(dir, cfg, { session_id: 'SID', stop_hook_active: false });
+    assert.equal(r2.stdout.trim(), '');
+    assert.equal(readState(dir).phase, 'resumed');
+    assert.ok(!fs.existsSync(marker));
+  });
+
   test('(b) uncommitted handoff is not "done"; handoff older than the request is not "done"', (t) => {
     const { dir, cfg } = makeProject(t, { autopause: { clear_command: 'echo never' } });
     const ctx = writeCtx('SID', 10);
@@ -381,6 +457,7 @@ describe('end to end (scratch git project)', () => {
     t.after(() => { try { fs.unlinkSync(script); } catch { /* gone */ } });
     fs.writeFileSync(script, `require('fs').writeFileSync(${JSON.stringify(marker)}, 'cleared');\n`);
     const { dir, cfg } = makeProject(t, { autopause: { clear_command: `${JSON.stringify(process.execPath)} ${JSON.stringify(script)}` } });
+    fs.writeFileSync(path.join(cfg, 'sessions', '4242.json'), JSON.stringify({ sessionId: 'SID', name: 'x', startedAt: Date.now() - 600000 }));
     const ctx = writeCtx('SID', 90);
     t.after(() => { try { fs.unlinkSync(ctx); } catch { /* gone */ } });
     const keep = run(dir, cfg, undefined, ['--keep-session'], { CLAUDE_CODE_SESSION_ID: 'SID' });

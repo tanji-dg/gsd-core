@@ -297,6 +297,12 @@ describe('end to end (scratch git project)', () => {
     ]);
     assert.match(gitOrThrow(['status', '--porcelain'], { cwd: dir }), /^ M \.planning\/STATE\.md/m);
 
+    // the pause hook's floor for the NEW session
+    const st = JSON.parse(fs.readFileSync(path.join(dir, '.claude', 'gsd-resume', 'state.NEW.json'), 'utf8'));
+    assert.equal(st.phase, 'resumed');
+    assert.ok(Date.parse(st.resumed_at) > 0);
+    assert.equal(st.old_sid, 'OLD');
+
     // watcher ack
     const resumed = JSON.parse(fs.readFileSync(path.join(dir, '.claude', 'gsd-resume', 'resumed.json'), 'utf8'));
     assert.equal(resumed.ok, true);

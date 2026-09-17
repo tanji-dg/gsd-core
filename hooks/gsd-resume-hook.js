@@ -552,6 +552,12 @@ function main() {
     allow(undefined);
   }
   finish(undefined);
+  // The pause hook's (b) lower bound for THIS session: a handoff must be newer
+  // than this resume to clear us again (the one we just consumed never will).
+  try {
+    const safe = String(sid).replace(/[^A-Za-z0-9._-]+/g, '_');
+    writeJsonAtomic(path.join(path.dirname(pendingPath), `state.${safe}.json`), { phase: 'resumed', resumed_at: result.at, old_sid: pending.old_sid, role_id: pending.role_id });
+  } catch (e) { /* best-effort — the pause hook falls back to the requested-pause rule */ }
   log(`done: role=${pending.role_id} commit=${result.commit} bytes=${result.injected_bytes}`);
   emit(text);
 }
