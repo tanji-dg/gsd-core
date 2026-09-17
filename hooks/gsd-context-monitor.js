@@ -237,6 +237,54 @@ let input = '';
  * block is last-writer-wins and would otherwise attribute the exhaustion to
  * whichever session wrote last.
  */
+/**
+ * The autopause capability's view of this project, for the warning text:
+ * { enabled, threshold } — threshold is autopause.threshold_used_pct, else
+ * 100 − the resolved CRITICAL fire-point (the pause hook derives the same
+ * default; see hooks/gsd-pause-hook.js resolveThreshold). Pure: takes the
+ * parsed config and the resolved thresholds.
+ */
+function resolveAutopause(config, thresholds) {
+  const ap = config && config.autopause && typeof config.autopause === 'object' ? config.autopause : {};
+  const enabled = ap.enabled === true;
+  const explicit = Number(ap.threshold_used_pct);
+  const threshold = Number.isFinite(explicit) && explicit > 0 && explicit <= 100
+    ? explicit
+    : 100 - (thresholds && Number.isFinite(thresholds.critical) ? thresholds.critical : CRITICAL_THRESHOLD);
+  return { enabled, threshold };
+}
+
+/**
+ * The advisory text for a fire-point. With autopause active there is ONE
+ * signal: the agent is told the pause is automatic and asked to finish the
+ * current step — running /gsd-pause-work by hand here produces a handoff
+ * that is stale by the time the automatic pause would have run.
+ */
+function buildWarningMessage({ isCritical, isGsdActive, usedPct, remaining, autopause, tokenDetail = '' }) {
+  const head = `CONTEXT ${isCritical ? 'CRITICAL' : 'WARNING'}: Usage at ${usedPct}%${tokenDetail}. Remaining: ${remaining}%. `;
+  if (isGsdActive && autopause && autopause.enabled) {
+    return head
+      + `Automatic pause will run at ${autopause.threshold}% used (autopause). Do NOT run /gsd-pause-work yourself `
+      + 'unless you want to hand over now — the session is paused, cleared and resumed automatically. '
+      + (isCritical
+        ? 'Do NOT start new complex work; finish the current step and let the pause hook take over.'
+        : 'Finish the current step; avoid starting new complex work.');
+  }
+  if (isCritical) {
+    return isGsdActive
+      ? head + 'Context is nearly exhausted. Do NOT start new complex work or write handoff files — '
+        + 'GSD state is already tracked in STATE.md. Inform the user so they can run '
+        + '/gsd:pause-work at the next natural stopping point.'
+      : head + 'Context is nearly exhausted. Inform the user that context is low and ask how they '
+        + 'want to proceed. Do NOT autonomously save state or write handoff files unless the user asks.';
+  }
+  return isGsdActive
+    ? head + 'Context is getting limited. Avoid starting new complex work. If not between '
+      + 'defined plan steps, inform the user so they can prepare to pause.'
+    : head + 'Be aware that context is getting limited. Avoid unnecessary exploration or '
+      + 'starting new complex work.';
+}
+
 function buildRecordSessionArgv(gsdTools, stoppedAt, sessionId) {
   const argv = [gsdTools, 'state', 'record-session', '--stopped-at', stoppedAt];
   if (typeof sessionId === 'string' && sessionId.trim() && !/[/\\]|\.\./.test(sessionId)) {
@@ -350,6 +398,7 @@ const handleStdinEnd = () => {
     // (ENOENT or parse error → use defaults, same as old "planningDir absent" branch).
     const cwd = data.cwd || process.cwd();
     let thresholds = { warning: WARNING_THRESHOLD, critical: CRITICAL_THRESHOLD };
+    let autopause = { enabled: false, threshold: 100 - CRITICAL_THRESHOLD };
     try {
       const configPath = path.join(cwd, '.planning', 'config.json');
       const config = JSON.parse(readConfigFileBounded(configPath, { required: true }));
@@ -361,6 +410,7 @@ const handleStdinEnd = () => {
       // path that does nothing. allow() exits the process (it does not throw),
       // so this line is unreachable when warnings are off.
       thresholds = resolveThresholds(config.hooks);
+      autopause = resolveAutopause(config, thresholds);
     } catch (e) {
       // Missing or unparseable config → proceed with defaults (context warnings
       // enabled, thresholds at the constants above, which `thresholds` already holds)
@@ -527,26 +577,7 @@ const handleStdinEnd = () => {
     const tokenDetail = Number.isFinite(metrics.used_tokens) && Number.isFinite(metrics.threshold_tokens)
       ? ` (${kTokens(metrics.used_tokens)} of ${kTokens(metrics.threshold_tokens)} usable tokens)`
       : '';
-    const usage = `Usage at ${usedPct}%${tokenDetail}. Remaining: ${remaining}%. `;
-    let message;
-    if (isCritical) {
-      message = isGsdActive
-        ? `CONTEXT CRITICAL: ${usage}` +
-          'Context is nearly exhausted. Do NOT start new complex work or write handoff files — ' +
-          'GSD state is already tracked in STATE.md. Inform the user so they can run ' +
-          '/gsd:pause-work at the next natural stopping point.'
-        : `CONTEXT CRITICAL: ${usage}` +
-          'Context is nearly exhausted. Inform the user that context is low and ask how they ' +
-          'want to proceed. Do NOT autonomously save state or write handoff files unless the user asks.';
-    } else {
-      message = isGsdActive
-        ? `CONTEXT WARNING: ${usage}` +
-          'Context is getting limited. Avoid starting new complex work. If not between ' +
-          'defined plan steps, inform the user so they can prepare to pause.'
-        : `CONTEXT WARNING: ${usage}` +
-          'Be aware that context is getting limited. Avoid unnecessary exploration or ' +
-          'starting new complex work.';
-    }
+    const message = buildWarningMessage({ isCritical, isGsdActive, usedPct, remaining, autopause, tokenDetail });
 
     // #2289: the hookSpecificOutput.additionalContext envelope is only a valid
     // output shape for the context-injection events (PostToolUse, and AfterTool
@@ -615,4 +646,4 @@ if (require.main === module) {
 // edited. criticalStoppedAt lets the #4905 test pin the breadcrumb's day
 // without waiting on the detached record-session writer (#3726).
 // buildRecordSessionArgv is exported for the per-session record-session test.
-module.exports = { resolveThresholds, WARNING_THRESHOLD, CRITICAL_THRESHOLD, criticalStoppedAt, buildRecordSessionArgv };
+module.exports = { resolveThresholds, WARNING_THRESHOLD, CRITICAL_THRESHOLD, criticalStoppedAt, buildRecordSessionArgv, resolveAutopause, buildWarningMessage };

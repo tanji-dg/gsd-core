@@ -24,10 +24,16 @@
 //       current state; below it the session simply stays paused (logged).
 //       No clear_command → logged ("set autopause.clear_command …"), the manual
 //       /clear → /gsd-resume-work path applies.
-//   (c) `--request-now` (CLI, no stdin; CLAUDE_CODE_SESSION_ID): write
-//       `pause-requested` (manual: true) only — the entry point that puts a
-//       hand-started pause onto the automatic path. Run it, then
-//       /gsd-pause-work in the same turn.
+//   (c) `--request-now` (CLI, no stdin; CLAUDE_CODE_SESSION_ID): arm the
+//       automatic path for a pause that is about to be written — writes
+//       `pause-requested` (manual: true) unless a live request already exists
+//       (idempotent, so the hook-initiated request is kept). pause-work.md
+//       runs it at its start whenever autopause is enabled, so EVERY pause —
+//       hook-initiated or hand-started — is cleared and resumed by (b).
+//       `--keep-session` instead writes `keep-session` (30 min): (b) will
+//       not spawn the clear command — the explicit "stay paused" opt-out
+//       (`/gsd-pause-work --keep-session`). Both are no-ops with a message
+//       when autopause.enabled is false.
 //
 // stop_hook_active == true is the Stop that follows our own block; blocking
 // again there would loop, so (a) is skipped — (b) still runs (the Stop after
@@ -35,7 +41,8 @@
 //
 // used% comes from <tmpdir>/claude-ctx-<sid>.json (written by gsd-statusline.js,
 // raw used_pct). Threshold: autopause.threshold_used_pct, else
-// 100 − hooks.context_warning_threshold (the monitor's WARNING point), else 65.
+// 100 − hooks.context_critical_threshold (the monitor's CRITICAL point), else
+// 75 — one signal: WARNING means "wrap up", CRITICAL means "the pause runs".
 //
 // State + log live next to autopause.pending_file (default
 // .claude/gsd-resume/): state.<sid>.json { phase, requested_at, used,
@@ -54,7 +61,7 @@ const ON_CRASH = HOOK_ON_CRASH.ALLOW;
 
 const REQUEST_TTL_MS = 30 * 60 * 1000;
 const HANDOFF_SLACK_MS = 60 * 1000;
-const DEFAULT_THRESHOLD_USED_PCT = 65;
+const DEFAULT_THRESHOLD_USED_PCT = 75;
 const GUARD_TIMEOUT_MS = 30000;
 
 // ---------------------------------------------------------------------------
@@ -92,13 +99,13 @@ function makeLogger(logPath) {
 // pure pieces (exported for tests)
 // ---------------------------------------------------------------------------
 
-/** The used% at which a pause is requested: autopause.threshold_used_pct, else 100 − warning threshold, else 65. */
+/** The used% at which a pause is requested: autopause.threshold_used_pct, else 100 − critical threshold, else 75. */
 function resolveThreshold(config) {
   const explicit = Number(readAutopauseConfig('', config).threshold_used_pct);
   if (Number.isFinite(explicit) && explicit > 0 && explicit <= 100) return explicit;
   const hooks = (config && config.hooks) || {};
-  const warning = Number(hooks.context_warning_threshold);
-  if (Number.isFinite(warning) && warning > 0 && warning <= 100) return 100 - warning;
+  const critical = Number(hooks.context_critical_threshold);
+  if (Number.isFinite(critical) && critical >= 0 && critical < 100) return 100 - critical;
   return DEFAULT_THRESHOLD_USED_PCT;
 }
 
@@ -111,9 +118,9 @@ function statePathFor(root, config, sid) {
   return path.join(stateDir(root, config), `state.${safe}.json`);
 }
 
-/** Is there a live (non-expired) pause request in this state? */
+/** Is there a live (non-expired) pause request — or keep-session opt-out — in this state? */
 function isRequested(state, nowMs) {
-  if (!state || (state.phase !== 'pause-requested' && state.phase !== 'clear-spawned')) return false;
+  if (!state || (state.phase !== 'pause-requested' && state.phase !== 'clear-spawned' && state.phase !== 'keep-session')) return false;
   const at = Date.parse(state.requested_at || '');
   return Number.isFinite(at) && nowMs - at >= 0 && nowMs - at < REQUEST_TTL_MS;
 }
@@ -135,6 +142,7 @@ function decide({ stopHookActive, state, handoff, used, threshold, nowMs }) {
   const requested = isRequested(state, nowMs);
   if (handoff && isHandoffForRequest(handoff.json, state, nowMs)) {
     if (state.phase === 'clear-spawned') return { kind: 'none', reason: 'clear already spawned' };
+    if (state.phase === 'keep-session') return { kind: 'none', reason: `keep-session (${handoff.file}) — staying paused by request` };
     return { kind: 'spawn-clear' };
   }
   if (stopHookActive) return { kind: 'none', reason: 'stop_hook_active (the Stop after our own block)' };
@@ -222,25 +230,42 @@ function findLatestContinueHere(root, roleId, hintDir) {
 // main
 // ---------------------------------------------------------------------------
 
-function requestNow(root) {
+function requestNow(root, keepSession) {
+  const flag = keepSession ? '--keep-session' : '--request-now';
   const sid = process.env.CLAUDE_CODE_SESSION_ID || '';
   if (!sid) {
-    process.stderr.write('gsd-pause-hook --request-now: CLAUDE_CODE_SESSION_ID is not set — run it from the session\'s own Bash tool\n');
+    process.stderr.write(`gsd-pause-hook ${flag}: CLAUDE_CODE_SESSION_ID is not set — run it from the session's own Bash tool\n`);
     process.exitCode = 1;
     return;
   }
   const config = readJson(path.join(root, '.planning', 'config.json')) || {};
+  if (!readAutopauseConfig(root, config).enabled) {
+    process.stdout.write(`autopause.enabled is false — ${flag} does nothing; the pause stays manual (/clear + /gsd-resume-work by hand).\n`);
+    return;
+  }
+  const sp = statePathFor(root, config, sid);
+  const log = makeLogger(path.join(stateDir(root, config), 'gsd-pause-hook.log'));
   const used = readUsedPct(sid);
-  const state = { phase: 'pause-requested', requested_at: new Date().toISOString(), manual: true, used, threshold: null };
-  writeJsonAtomic(statePathFor(root, config, sid), state);
-  makeLogger(path.join(stateDir(root, config), 'gsd-pause-hook.log'))(`${sid8(sid)} pause-requested manually (used=${used}%)`);
+  const existing = readJson(sp);
+  if (keepSession) {
+    writeJsonAtomic(sp, { phase: 'keep-session', requested_at: new Date().toISOString(), manual: true, used, threshold: null });
+    log(`${sid8(sid)} keep-session (used=${used}%) — the next committed pause will NOT be cleared`);
+    process.stdout.write(`keep-session written for ${sid8(sid)}: the pause you write now stays paused (no automatic /clear for 30 min).\n`);
+    return;
+  }
+  if (isRequested(existing, Date.now()) && existing.phase !== 'keep-session') {
+    process.stdout.write(`pause already requested for ${sid8(sid)} at ${existing.requested_at} — kept.\n`);
+    return;
+  }
+  writeJsonAtomic(sp, { phase: 'pause-requested', requested_at: new Date().toISOString(), manual: true, used, threshold: null });
+  log(`${sid8(sid)} pause-requested manually (used=${used}%)`);
   process.stdout.write(`pause-requested written for ${sid8(sid)}. Now run the gsd-pause-work skill; the Stop after its commit spawns autopause.clear_command.\n`);
 }
 
 function main() {
   const argv = process.argv.slice(2);
-  if (argv.includes('--request-now')) {
-    requestNow(process.cwd());
+  if (argv.includes('--request-now') || argv.includes('--keep-session')) {
+    requestNow(process.cwd(), argv.includes('--keep-session'));
     return;
   }
   let raw = '';

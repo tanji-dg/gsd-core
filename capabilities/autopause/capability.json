@@ -27,12 +27,12 @@
     "autopause.enabled": {
       "type": "boolean",
       "default": false,
-      "description": "Master toggle. Off: the pause hook does nothing and the resume hook only lists unclaimed HANDOFF.latest.*.json files (safe without opt-in). On: the unattended cycle runs whenever the *_command keys below are configured."
+      "description": "Master toggle. Off: the pause hook does nothing and the resume hook only lists unclaimed HANDOFF.latest.*.json files (safe without opt-in). On: EVERY pause — hook-initiated or a hand-run /gsd-pause-work — is cleared and resumed automatically once committed (pause-work arms the cycle at its start); /gsd-pause-work --keep-session is the opt-out. The context monitor's warnings then point at the automatic pause instead of asking for a manual one."
     },
     "autopause.threshold_used_pct": {
       "type": "number",
-      "default": 65,
-      "description": "Context used% at or above which the Stop hook asks the session to run /gsd-pause-work. When absent the hook derives 100 − hooks.context_warning_threshold (the context monitor's WARNING point), which is 65 with the monitor's default; the registry default mirrors that."
+      "default": 75,
+      "description": "Context used% at or above which the Stop hook asks the session to run /gsd-pause-work. When absent the hook derives 100 − hooks.context_critical_threshold (the context monitor's CRITICAL point; 75 with the monitor's default) — one signal: WARNING means wrap up, CRITICAL means the pause runs. The registry default mirrors that."
     },
     "autopause.guard_command": {
       "type": "string",

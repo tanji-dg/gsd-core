@@ -33,13 +33,16 @@ const NOW = Date.parse('2026-09-17T01:00:00Z');
 const iso = (offsetMs) => new Date(NOW + offsetMs).toISOString();
 
 describe('pure pieces', () => {
-  test('resolveThreshold: explicit > derived from warning threshold > 65', () => {
-    assert.equal(hook.resolveThreshold({}), 65);
-    assert.equal(hook.resolveThreshold({ hooks: { context_warning_threshold: 20 } }), 80);
-    assert.equal(hook.resolveThreshold({ autopause: { threshold_used_pct: 80 }, hooks: { context_warning_threshold: 35 } }), 80);
-    assert.equal(hook.resolveThreshold({ autopause: { threshold_used_pct: 0 } }), 65);
-    assert.equal(hook.resolveThreshold({ autopause: { threshold_used_pct: 'abc' }, hooks: { context_warning_threshold: 150 } }), 65);
-    assert.equal(hook.resolveThreshold({ hooks: { pause_threshold_used_pct: 80 } }), 65, 'the pre-capability spelling is not read');
+  test('resolveThreshold: explicit > derived from the CRITICAL threshold > 75 (one signal)', () => {
+    assert.equal(hook.resolveThreshold({}), 75);
+    assert.equal(hook.resolveThreshold({ hooks: { context_critical_threshold: 20 } }), 80);
+    assert.equal(hook.resolveThreshold({ hooks: { context_warning_threshold: 20 } }), 75, 'the WARNING point no longer drives the pause');
+    assert.equal(hook.resolveThreshold({ autopause: { threshold_used_pct: 80 }, hooks: { context_critical_threshold: 25 } }), 80);
+    assert.equal(hook.resolveThreshold({ autopause: { threshold_used_pct: 0 } }), 75);
+    assert.equal(hook.resolveThreshold({ autopause: { threshold_used_pct: 'abc' }, hooks: { context_critical_threshold: 150 } }), 75);
+    assert.equal(hook.resolveThreshold({ hooks: { pause_threshold_used_pct: 80 } }), 75, 'the pre-capability spelling is not read');
+    const monitor = require('../hooks/gsd-context-monitor.js');
+    assert.equal(hook.resolveThreshold({}), monitor.resolveAutopause({}, monitor.resolveThresholds({})).threshold, 'pause hook and context monitor derive the same default');
   });
 
   test('isRequested: phase + TTL', () => {
@@ -49,6 +52,7 @@ describe('pure pieces', () => {
     assert.equal(hook.isRequested({ phase: 'pause-requested', requested_at: iso(-hook.REQUEST_TTL_MS - 1) }, NOW), false);
     assert.equal(hook.isRequested({ phase: 'pause-requested', requested_at: 'garbage' }, NOW), false);
     assert.equal(hook.isRequested({ phase: 'other', requested_at: iso(-1000) }, NOW), false);
+    assert.equal(hook.isRequested({ phase: 'keep-session', requested_at: iso(-60000) }, NOW), true);
   });
 
   test('isHandoffForRequest: only a handoff written after the request (60 s slack)', () => {
@@ -79,6 +83,11 @@ describe('pure pieces', () => {
     assert.match(hook.decide({ ...base, handoff: old, used: 30 }).reason, /manual pause on disk .* staying paused/);
     // requested but the handoff on disk predates the request → not (b); TTL still blocks (a)
     assert.match(hook.decide({ ...base, state: requested, handoff: old }).reason, /already requested/);
+    // keep-session: the committed pause is NOT cleared, and no re-request within the TTL
+    const keep = { phase: 'keep-session', requested_at: iso(-120000) };
+    assert.match(hook.decide({ ...base, state: keep, handoff: fresh, stopHookActive: true }).reason, /keep-session .* staying paused by request/);
+    assert.match(hook.decide({ ...base, state: keep, handoff: fresh, used: 95 }).reason, /keep-session/);
+    assert.match(hook.decide({ ...base, state: keep }).reason, /already requested/);
   });
 
   test('blockReason carries the two unattended rules', () => {
@@ -95,6 +104,37 @@ describe('pure pieces', () => {
     const root = path.resolve(os.tmpdir(), 'proj');
     assert.equal(hook.statePathFor(root, {}, 'a/b'), path.resolve(root, '.claude', 'gsd-resume', 'state.a_b.json'));
     assert.equal(hook.statePathFor(root, { autopause: { pending_file: '.claude/autoclear/pending.json' } }, 'S'), path.resolve(root, '.claude', 'autoclear', 'state.S.json'));
+  });
+});
+
+describe('context monitor: one signal', () => {
+  const monitor = require('../hooks/gsd-context-monitor.js');
+
+  test('resolveAutopause: enabled flag + threshold derived from CRITICAL', () => {
+    const th = monitor.resolveThresholds({});
+    assert.deepEqual(monitor.resolveAutopause({}, th), { enabled: false, threshold: 75 });
+    assert.deepEqual(monitor.resolveAutopause({ autopause: { enabled: true } }, monitor.resolveThresholds({ context_warning_threshold: 40, context_critical_threshold: 20 })), { enabled: true, threshold: 80 });
+    assert.deepEqual(monitor.resolveAutopause({ autopause: { enabled: true, threshold_used_pct: 80 } }, th), { enabled: true, threshold: 80 });
+    assert.equal(monitor.resolveAutopause({ autopause: { enabled: 'true' } }, th).enabled, false);
+  });
+
+  test('buildWarningMessage: autopause on → points at the automatic pause; off → the classic text', () => {
+    const on = { enabled: true, threshold: 80 };
+    const off = { enabled: false, threshold: 75 };
+    const w = monitor.buildWarningMessage({ isCritical: false, isGsdActive: true, usedPct: 69, remaining: 31, autopause: on });
+    assert.match(w, /^CONTEXT WARNING: Usage at 69%\. Remaining: 31%\. Automatic pause will run at 80% used \(autopause\)\. Do NOT run \/gsd-pause-work yourself/);
+    assert.match(w, /Finish the current step/);
+    const c = monitor.buildWarningMessage({ isCritical: true, isGsdActive: true, usedPct: 78, remaining: 22, autopause: on });
+    assert.match(c, /^CONTEXT CRITICAL: .*Automatic pause will run at 80% used/);
+    assert.match(c, /let the pause hook take over/);
+    assert.doesNotMatch(c, /Inform the user so they can run/);
+    const classicW = monitor.buildWarningMessage({ isCritical: false, isGsdActive: true, usedPct: 69, remaining: 31, autopause: off });
+    assert.match(classicW, /inform the user so they can prepare to pause/);
+    const classicC = monitor.buildWarningMessage({ isCritical: true, isGsdActive: true, usedPct: 78, remaining: 22, autopause: off });
+    assert.match(classicC, /\/gsd:pause-work at the next natural stopping point/);
+    // autopause never changes the non-GSD text
+    const nonGsd = monitor.buildWarningMessage({ isCritical: true, isGsdActive: false, usedPct: 78, remaining: 22, autopause: on });
+    assert.match(nonGsd, /ask how they want to proceed/);
   });
 });
 
@@ -172,18 +212,18 @@ describe('end to end (scratch git project)', () => {
 
   test('(a) above threshold → block with the unattended rules; state pause-requested; not twice; not on stop_hook_active', (t) => {
     const { dir, cfg } = makeProject(t, { hooks: { context_warning_threshold: 35 } });
-    const ctx = writeCtx('SID', 70);
+    const ctx = writeCtx('SID', 76);
     t.after(() => { try { fs.unlinkSync(ctx); } catch { /* gone */ } });
     const r = run(dir, cfg, { session_id: 'SID', stop_hook_active: false });
     assert.equal(r.exitCode, 0, r.stderr);
     assert.equal(r.json.decision, 'block');
-    assert.match(r.json.reason, /Context is at 70% used \(threshold 65%\)/);
+    assert.match(r.json.reason, /Context is at 76% used \(threshold 75%\)/);
     assert.match(r.json.reason, /Do not ask the user anything/);
     assert.match(r.json.reason, /measure it now/);
     const st = readState(dir);
     assert.equal(st.phase, 'pause-requested');
-    assert.equal(st.used, 70);
-    assert.equal(st.threshold, 65);
+    assert.equal(st.used, 76);
+    assert.equal(st.threshold, 75);
 
     const again = run(dir, cfg, { session_id: 'SID', stop_hook_active: false });
     assert.equal(again.stdout.trim(), '', 'requested within the TTL → silent');
@@ -274,7 +314,7 @@ describe('end to end (scratch git project)', () => {
     t.after(() => { try { fs.unlinkSync(ctx); } catch { /* gone */ } });
     const low = run(dir, cfg, { session_id: 'SID', stop_hook_active: false });
     assert.equal(low.stdout.trim(), '');
-    assert.match(readLog(dir), /manual pause on disk \(HANDOFF\.latest\.coordinator\.json\) and used=30% < 65% — staying paused/);
+    assert.match(readLog(dir), /manual pause on disk \(HANDOFF\.latest\.coordinator\.json\) and used=30% < 75% — staying paused/);
     assert.ok(!fs.existsSync(statePath(dir)));
     writeCtx('SID', 90);
     const high = run(dir, cfg, { session_id: 'SID', stop_hook_active: false });
@@ -319,5 +359,65 @@ describe('end to end (scratch git project)', () => {
     assert.equal(st.used, 42);
     const noSid = run(dir, cfg, undefined, ['--request-now']);
     assert.notEqual(noSid.exitCode, 0);
+    // idempotent: a live request (hook-initiated) is kept, not overwritten
+    fs.writeFileSync(statePath(dir), JSON.stringify({ phase: 'pause-requested', requested_at: new Date(Date.now() - 60000).toISOString(), used: 80, threshold: 75 }));
+    const again = run(dir, cfg, undefined, ['--request-now'], { CLAUDE_CODE_SESSION_ID: 'SID' });
+    assert.match(again.stdout, /already requested/);
+    assert.equal(readState(dir).used, 80);
+  });
+
+  test('--request-now with autopause disabled → message only, nothing written', (t) => {
+    const { dir, cfg } = makeProject(t, { autopause: { enabled: false } });
+    const r = run(dir, cfg, undefined, ['--request-now'], { CLAUDE_CODE_SESSION_ID: 'SID' });
+    assert.equal(r.exitCode, 0, r.stderr);
+    assert.match(r.stdout, /autopause\.enabled is false/);
+    assert.ok(!fs.existsSync(path.join(dir, '.claude')));
+  });
+
+  test('--keep-session → the committed pause is not cleared (the explicit opt-out)', (t) => {
+    const marker = path.join(os.tmpdir(), `gsd-pause-hook-keep-${process.pid}-${Date.now()}.txt`);
+    t.after(() => { try { fs.unlinkSync(marker); } catch { /* gone */ } });
+    const script = path.join(os.tmpdir(), `gsd-pause-hook-keep-${process.pid}-${Date.now()}.cjs`);
+    t.after(() => { try { fs.unlinkSync(script); } catch { /* gone */ } });
+    fs.writeFileSync(script, `require('fs').writeFileSync(${JSON.stringify(marker)}, 'cleared');\n`);
+    const { dir, cfg } = makeProject(t, { autopause: { clear_command: `${JSON.stringify(process.execPath)} ${JSON.stringify(script)}` } });
+    const ctx = writeCtx('SID', 90);
+    t.after(() => { try { fs.unlinkSync(ctx); } catch { /* gone */ } });
+    const keep = run(dir, cfg, undefined, ['--keep-session'], { CLAUDE_CODE_SESSION_ID: 'SID' });
+    assert.equal(keep.exitCode, 0, keep.stderr);
+    assert.match(keep.stdout, /keep-session written/);
+    assert.equal(readState(dir).phase, 'keep-session');
+    // the pause is written and committed after arming, as pause-work.md does
+    commitHandoff(dir, 'SID', 'coordinator', new Date().toISOString());
+    const r = run(dir, cfg, { session_id: 'SID', stop_hook_active: true });
+    assert.equal(r.stdout.trim(), '', 'no block, no spawn');
+    assert.equal(readState(dir).phase, 'keep-session');
+    assert.match(readLog(dir), /keep-session .* staying paused by request/);
+    assert.ok(!fs.existsSync(marker), 'clear_command must not run');
+    // and even at 90% used, no re-request while keep-session is live
+    const r2 = run(dir, cfg, { session_id: 'SID', stop_hook_active: false });
+    assert.equal(r2.stdout.trim(), '');
+  });
+
+  test('pause-work path end to end: arm (--request-now) → write + commit handoff → the Stop spawns clear', async (t) => {
+    const marker = path.join(os.tmpdir(), `gsd-pause-hook-arm-${process.pid}-${Date.now()}.txt`);
+    t.after(() => { try { fs.unlinkSync(marker); } catch { /* gone */ } });
+    const script = path.join(os.tmpdir(), `gsd-pause-hook-arm-${process.pid}-${Date.now()}.cjs`);
+    t.after(() => { try { fs.unlinkSync(script); } catch { /* gone */ } });
+    fs.writeFileSync(script, `require('fs').writeFileSync(${JSON.stringify(marker)}, process.env.GSD_CLEAR_ROLE_ID || '');\n`);
+    const { dir, cfg } = makeProject(t, { autopause: { clear_command: `${JSON.stringify(process.execPath)} ${JSON.stringify(script)}` } });
+    const ctx = writeCtx('SID', 40);
+    t.after(() => { try { fs.unlinkSync(ctx); } catch { /* gone */ } });
+    // a hand-started /gsd-pause-work well below the threshold
+    const arm = run(dir, cfg, undefined, ['--request-now'], { CLAUDE_CODE_SESSION_ID: 'SID' });
+    assert.equal(arm.exitCode, 0, arm.stderr);
+    assert.equal(readState(dir).manual, true);
+    commitHandoff(dir, 'SID', 'coordinator', new Date().toISOString());
+    const r = run(dir, cfg, { session_id: 'SID', stop_hook_active: false });
+    assert.equal(r.exitCode, 0, r.stderr);
+    assert.equal(r.stdout.trim(), '');
+    assert.equal(readState(dir).phase, 'clear-spawned');
+    await waitFor(() => fs.existsSync(marker), { timeoutMs: PROBE_TIMEOUT_MS, message: 'clear_command did not run' });
+    assert.equal(fs.readFileSync(marker, 'utf8'), 'coordinator');
   });
 });

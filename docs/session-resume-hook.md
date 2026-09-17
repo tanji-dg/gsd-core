@@ -124,14 +124,22 @@ otherwise                       → nothing
   above the threshold (a) re-requests so the handoff is rewritten from current
   state; below it the session stays paused (logged).
 - `node gsd-pause-hook.js --request-now` (from the session's own Bash;
-  `CLAUDE_CODE_SESSION_ID`) writes `pause-requested` (`manual: true`) and
-  nothing else — run it, then `/gsd-pause-work`, and the Stop after the commit
-  takes the automatic path.
+  `CLAUDE_CODE_SESSION_ID`) writes `pause-requested` (`manual: true`) unless a
+  live request exists; `--keep-session` writes `keep-session`. Both are no-ops
+  with a message while autopause is off.
 - State/log: `state.<sid>.json` and `gsd-pause-hook.log` next to
   `autopause.pending_file`. `stop_hook_active` (the Stop after our own
   block) never blocks again.
 
-Threshold: `autopause.threshold_used_pct`, else `100 − hooks.context_warning_threshold`, else 65.
+Threshold: `autopause.threshold_used_pct`, else `100 − hooks.context_critical_threshold`, else 75 — the
+context monitor derives the same number and, with autopause on, its WARNING/CRITICAL text says
+"Automatic pause will run at N% … Do NOT run /gsd-pause-work yourself" (one signal, not two).
+
+**One path, not two.** `/gsd-pause-work` runs `gsd-pause-hook.js --request-now` at its start
+whenever autopause is on (idempotent when the hook already requested), so a hand-started pause is
+cleared and resumed exactly like a hook-requested one — the freshest handoff is the one written
+right before the clear. `/gsd-pause-work --keep-session` writes `keep-session` (30 min) instead
+and (b) leaves that pause alone.
 Guard env: `GSD_PAUSE_SESSION_ID`, `GSD_PAUSE_CLAUDE_PID`, `GSD_PAUSE_USED_PCT`.
 Clear env: `GSD_CLEAR_SESSION_ID` (old id), `GSD_CLEAR_CLAUDE_PID`, `GSD_CLEAR_SESSION_NAME`
 (from `<CLAUDE_CONFIG_DIR>/sessions/<pid>.json`), `GSD_CLEAR_ROLE`, `GSD_CLEAR_ROLE_ID`,
