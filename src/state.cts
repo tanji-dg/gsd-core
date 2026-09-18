@@ -2369,6 +2369,43 @@ function resolveExplicitHandoffPath(cwd: string, handoff: string): string {
  * `applyPreserveWhenUnchanged` — see cmdStateUpdate). A hand-written
  * `Paused At:` line is an explicit pause and is left alone.
  */
+/** The frontmatter `status` verdict of a session resume — see repairLegacyPausedStatus. */
+type SessionResumeStatus = { before: string | null; after: string | null; cleared: boolean; reason?: string };
+
+/**
+ * Pause is per session (a handoff file), never `status: paused` in STATE.md
+ * — but a pre-role-keyed pause-work wrote exactly that, and it stuck for
+ * every session sharing the file. On resume, when the frontmatter says
+ * `paused` and no explicit `Paused At:` line under `## Session` claims it,
+ * re-derive `status` from the body `Status:` line and put it in
+ * `authoritativeFm` for the write. Anything ambiguous is left as is, with
+ * the reason reported.
+ */
+function repairLegacyPausedStatus(content: string, statePath: string, authoritativeFm: Record<string, unknown>): SessionResumeStatus {
+  const fm = extractFrontmatter(content, statePath) as Record<string, unknown>;
+  const before = typeof fm['status'] === 'string' ? fm['status'] : null;
+  const status: SessionResumeStatus = { before, after: before, cleared: false };
+  if (before !== 'paused') return status;
+  const body = stripFrontmatter(content);
+  const sessionScope = matchSessionSection(body) ?? body;
+  const pausedAt = stateExtractField(sessionScope, 'Paused At');
+  if (pausedAt && pausedAt.trim()) {
+    status.reason = 'explicit Paused At line under ## Session — left as is';
+    return status;
+  }
+  const derived = normalizeStateStatus(stateExtractField(body, 'Status'), null);
+  if (derived === 'paused' || derived === 'unknown') {
+    status.reason = derived === 'unknown'
+      ? 'no body Status: line to re-derive from — left as is'
+      : 'body Status: is itself paused — left as is';
+    return status;
+  }
+  authoritativeFm['status'] = derived;
+  status.after = derived;
+  status.cleared = true;
+  return status;
+}
+
 function cmdStateSessionResume(cwd: string, options: StateSessionResumeOptions, raw: boolean): void {
   const statePath = planningPaths(cwd).state;
   if (!fs.existsSync(statePath)) { output({ error: 'STATE.md not found' }, raw, undefined); return; }
@@ -2393,36 +2430,10 @@ function cmdStateSessionResume(cwd: string, options: StateSessionResumeOptions, 
   const preWriteState: StatePreWriteSnapshot = {};
   const authoritativeFm: Record<string, unknown> = {};
   const flags = { sessionCreated: false };
-  const status: { before: string | null; after: string | null; cleared: boolean; reason?: string } = {
-    before: null,
-    after: null,
-    cleared: false,
-  };
+  const status: SessionResumeStatus = { before: null, after: null, cleared: false };
 
   readModifyWriteStateMd(statePath, (content) => {
-    const fm = extractFrontmatter(content, statePath) as Record<string, unknown>;
-    const before = typeof fm['status'] === 'string' ? fm['status'] : null;
-    status.before = before;
-    status.after = before;
-    if (before === 'paused') {
-      const body = stripFrontmatter(content);
-      const sessionScope = matchSessionSection(body) ?? body;
-      const pausedAt = stateExtractField(sessionScope, 'Paused At');
-      if (pausedAt && pausedAt.trim()) {
-        status.reason = 'explicit Paused At line under ## Session — left as is';
-      } else {
-        const derived = normalizeStateStatus(stateExtractField(body, 'Status'), null);
-        if (derived === 'paused' || derived === 'unknown') {
-          status.reason = derived === 'unknown'
-            ? 'no body Status: line to re-derive from — left as is'
-            : 'body Status: is itself paused — left as is';
-        } else {
-          authoritativeFm['status'] = derived;
-          status.after = derived;
-          status.cleared = true;
-        }
-      }
-    }
+    Object.assign(status, repairLegacyPausedStatus(content, statePath, authoritativeFm));
     return applyRecordSessionTransform(content, recordOptions, now, updated, flags);
   }, cwd, { divergedFields, preWriteState, authoritativeFm });
 

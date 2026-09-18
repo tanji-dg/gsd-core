@@ -153,7 +153,7 @@ fi
   ```
   Do the same for the matching `.continue-here.latest.${role_id}.md` (in the phase dir or wherever it was found). If the `mv` fails because the file is gone, another session claimed the role — report that and stop; do not fall back to reading its `claimed.*` copy.
 - Parse `status`, `phase`, `plan`, `task`, `total_tasks`, `next_action`
-- **Restore `role` if present** — if this session is resuming under a specific assigned role (coordinator, hardware operator, design reviewer, etc.), the role must carry over; do not silently drop it. If the project has a role registry (e.g. a statusline register command), register the role there now, as this session. State the restored role back to the user as part of the resumption flag.
+- **Restore `role` if present** — if this session is resuming under a specific assigned role (coordinator, implementer, reviewer, etc.), the role must carry over; do not silently drop it. If the project has a role registry (e.g. a per-session role file), register the role there now, as this session. State the restored role back to the user as part of the resumption flag.
 - Check `blockers` and `human_actions_pending` — surface these immediately
 - Check `completed_tasks` for `in_progress` items — these need attention first
 - Validate `uncommitted_files` against `git status` — flag divergence
