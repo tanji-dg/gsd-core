@@ -3,7 +3,7 @@
 <purpose>
 Create structured `.planning/HANDOFF.json` and `.continue-here.md` handoff files to preserve complete work state across sessions. The JSON provides machine-readable state for `/gsd:resume-work`; the markdown provides human-readable context. Both filenames are keyed by the session's **role** when it has one (e.g. `HANDOFF.latest.design.json`) — the role is the identity that survives `/clear` and restarts, so the resuming session can find its own handoff and claim it. Sessions without a role fall back to a session-id key (`HANDOFF.<session_id>.json`) so concurrent sessions paused in the same directory still don't overwrite each other.
 
-**Pause is per session, not per project.** Several sessions (coordinator, hardware operator, design reviewer, …) may share one `.planning/`; the others keep working while this one pauses. A session's paused state is represented **solely by the existence of its handoff file** under `.planning/` — the statusline, `/gsd:next` and `/gsd:resume-work` all read it from there. **Never set STATE.md `status:` to `paused` and never add a `Paused At:` line** — that would flip every session's status and there is no GSD path back out of it. The shared `## Session` block still gets a heartbeat (`state record-session`) for backward compatibility, and the same fields are mirrored to this session's own record `.planning/sessions/<session_id>.json`.
+**Pause is per session, not per project.** Several sessions (coordinator, implementer, reviewer, …) may share one `.planning/`; the others keep working while this one pauses. A session's paused state is represented **solely by the existence of its handoff file** under `.planning/` — the statusline, `/gsd:next` and `/gsd:resume-work` all read it from there. **Never set STATE.md `status:` to `paused` and never add a `Paused At:` line** — that would flip every session's status and there is no GSD path back out of it. The shared `## Session` block still gets a heartbeat (`state record-session`) for backward compatibility, and the same fields are mirrored to this session's own record `.planning/sessions/<session_id>.json`.
 </purpose>
 
 <required_reading>
@@ -91,8 +91,8 @@ It prints one line (no-op when autopause is disabled, idempotent when the hook a
 **Collect complete state for handoff:**
 
 1. **Current position**: Which phase, which plan, which task
-2. **Session role** (if this session was operating under an assigned role — e.g. a named role in a multi-session/multi-role workflow such as "coordinator", "hardware operator", "design reviewer"): capture it verbatim as `role` so resume restores the same role instead of dropping it. Prefer the project's own role registry as the source of truth when it has one (e.g. a per-session role file the project's statusline reads) over recalling the role from conversation — the two must not disagree.
-   - Also derive **`role_id`**: a short filesystem-safe slug of the role (`[a-z0-9-]+`, ASCII only — no spaces, no non-ASCII, since it becomes part of a filename). If the project defines its roles in files (e.g. `docs/roles/<slug>.md`), use that slug verbatim; otherwise lowercase the role's English name and join words with `-` (`hardware operator` → `hardware-operator`). Set `role_id` in the detect step's shell before computing the filenames. Leave it empty when the session has no role.
+2. **Session role** (if this session was operating under an assigned role — e.g. a named role in a multi-session/multi-role workflow such as "coordinator", "implementer", "reviewer"): capture it verbatim as `role` so resume restores the same role instead of dropping it. Prefer the project's own role registry as the source of truth when it has one (e.g. a per-session role file) over recalling the role from conversation — the two must not disagree.
+   - Also derive **`role_id`**: a short filesystem-safe slug of the role (`[a-z0-9-]+`, ASCII only — no spaces, no non-ASCII, since it becomes part of a filename). If the project defines its roles in files (e.g. `docs/roles/<slug>.md`), use that slug verbatim; otherwise lowercase the role's English name and join words with `-` (`code reviewer` → `code-reviewer`). Set `role_id` in the detect step's shell before computing the filenames. Leave it empty when the session has no role.
 3. **Work completed**: What got done this session
 4. **Work remaining**: What's left in current plan/phase
 5. **Decisions made**: Key decisions and rationale
@@ -107,7 +107,7 @@ It prints one line (no-op when autopause is disabled, idempotent when the hook a
 
 **Do not block on the user.** This workflow may be running unattended (an external watcher can send `/gsd:pause-work` while the user is away — see the `gsd-resume-hook` SessionStart hook). Ask a clarifying question only when the user is clearly present and the answer changes what gets written; otherwise write `unknown` for the item and say why in `context_notes` — never leave the pause half-written waiting for an answer.
 
-**Role source of truth**: when the project keeps a role registry (a per-session role file, `docs/roles/`, a statusline register command, …), take `role` and `role_id` from there — the registry's slug is the `role_id`, verbatim; do not re-derive it from the role's wording. Only derive the slug yourself when the project has no registry. If the registry has no entry for this session, leave both empty and note it.
+**Role source of truth**: when the project keeps a role registry (a per-session role file, `docs/roles/`, …), take `role` and `role_id` from there — the registry's slug is the `role_id`, verbatim; do not re-derive it from the role's wording. Only derive the slug yourself when the project has no registry. If the registry has no entry for this session, leave both empty and note it.
 
 **Also inspect SUMMARY.md files for false completions:**
 ```bash
@@ -130,7 +130,7 @@ timestamp=$(gsd_run query current-timestamp full --raw)
   "version": "1.0",
   "timestamp": "{timestamp}",
   "session_id": "{value of $CLAUDE_CODE_SESSION_ID, or \"unknown\" if unset}",
-  "role": "{this session's assigned role, verbatim, e.g. \"coordinator\", \"hardware operator\" — omit or null if this session has no assigned role}",
+  "role": "{this session's assigned role, verbatim, e.g. \"coordinator\", \"implementer\" — omit or null if this session has no assigned role}",
   "role_id": "{slug used in the filename, e.g. \"coordinator\", \"hardware-operator\" — omit or null when role is absent}",
   "phase": "{phase_number}",
   "phase_name": "{phase_name}",

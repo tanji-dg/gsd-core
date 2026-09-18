@@ -99,9 +99,9 @@ describe('session-store: identity', () => {
   });
 
   test('sanitizeRoleId slugs like pause-work.md', () => {
-    assert.equal(sessionStore.sanitizeRoleId('hardware operator'), 'hardware-operator');
+    assert.equal(sessionStore.sanitizeRoleId('code reviewer'), 'code-reviewer');
     assert.equal(sessionStore.sanitizeRoleId('coordinator'), 'coordinator');
-    assert.equal(sessionStore.sanitizeRoleId('調整役'), null);
+    assert.equal(sessionStore.sanitizeRoleId('ÄÖÜ'), null); // nothing ASCII-alphanumeric survives → no slug
     assert.equal(sessionStore.sanitizeRoleId(null), null);
   });
 });
@@ -151,7 +151,7 @@ describe('session-store: records + handoffs', () => {
     t.after(() => cleanup(dir));
     writeHandoff(dir, 'HANDOFF.json', { session_id: 'L' });
     writeHandoff(dir, 'HANDOFF.sid-1.json', {});
-    writeHandoff(dir, 'HANDOFF.latest.design.json', { role: 'design reviewer' });
+    writeHandoff(dir, 'HANDOFF.latest.design.json', { role: 'reviewer' });
     writeHandoff(dir, 'HANDOFF.claimed.hardware.sid-2.json', {});
     fs.writeFileSync(path.join(dir, '.planning', 'HANDOFF.txt'), 'not a handoff');
     const byFile = Object.fromEntries(sessionStore.listHandoffs(dir).map((h) => [h.file, h]));
@@ -164,7 +164,7 @@ describe('session-store: records + handoffs', () => {
     assert.equal(byFile['HANDOFF.sid-1.json'].session_id, 'sid-1');
     assert.equal(byFile['HANDOFF.latest.design.json'].kind, 'role');
     assert.equal(byFile['HANDOFF.latest.design.json'].role_id, 'design');
-    assert.equal(byFile['HANDOFF.latest.design.json'].role, 'design reviewer');
+    assert.equal(byFile['HANDOFF.latest.design.json'].role, 'reviewer');
     assert.equal(byFile['HANDOFF.claimed.hardware.sid-2.json'].kind, 'claimed');
     assert.equal(byFile['HANDOFF.claimed.hardware.sid-2.json'].role_id, 'hardware');
     assert.equal(byFile['HANDOFF.claimed.hardware.sid-2.json'].session_id, 'sid-2');
@@ -306,15 +306,15 @@ describe('state record-session --session', () => {
     const dir = createTempProject('gsd-record-session-');
     t.after(() => cleanup(dir));
     fs.writeFileSync(statePath(dir), STATE_LEGACY_PAUSED);
-    assert.ok(runGsdTools(['state', 'record-session', '--stopped-at', 'same', '--session', 'A', '--role', 'hardware operator'], dir).success);
+    assert.ok(runGsdTools(['state', 'record-session', '--stopped-at', 'same', '--session', 'A', '--role', 'implementer'], dir).success);
     const again = runGsdTools(['state', 'record-session', '--stopped-at', 'same', '--session', 'A'], dir);
     assert.ok(again.success, again.error);
     const out = JSON.parse(again.output);
     assert.equal(out.recorded, true, 'a per-session record write is a recorded heartbeat, not a no-op');
     assert.equal(out.session_id, 'A');
     const rec = readJson(path.join(dir, '.planning', 'sessions', 'A.json'));
-    assert.equal(rec.role, 'hardware operator');
-    assert.equal(rec.role_id, 'hardware-operator');
+    assert.equal(rec.role, 'implementer');
+    assert.equal(rec.role_id, 'implementer');
   });
 });
 
@@ -427,14 +427,14 @@ describe('state session-resume', () => {
     writeHandoff(dir, 'HANDOFF.claimed.design.A.json', {});
     writeHandoff(dir, 'HANDOFF.claimed.design.B.json', {});
     writeHandoff(dir, 'HANDOFF.latest.hardware.json', {});
-    const r = runGsdTools(['state', 'session-resume', '--session', 'A', '--role', 'design reviewer', '--role-id', 'design'], dir);
+    const r = runGsdTools(['state', 'session-resume', '--session', 'A', '--role', 'reviewer', '--role-id', 'design'], dir);
     assert.ok(r.success, r.error);
     const out = JSON.parse(r.output);
     assert.equal(out.role_id, 'design');
     assert.deepEqual(out.handoff_removed, ['.planning/HANDOFF.claimed.design.A.json']);
     assert.ok(fs.existsSync(path.join(dir, '.planning', 'HANDOFF.claimed.design.B.json')));
     assert.ok(fs.existsSync(path.join(dir, '.planning', 'HANDOFF.latest.hardware.json')));
-    assert.equal(readJson(path.join(dir, '.planning', 'sessions', 'A.json')).role, 'design reviewer');
+    assert.equal(readJson(path.join(dir, '.planning', 'sessions', 'A.json')).role, 'reviewer');
   });
 
   test('STATE.md missing → error payload, no throw', (t) => {

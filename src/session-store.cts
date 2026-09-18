@@ -1,7 +1,7 @@
 /**
  * Per-session continuity records + handoff discovery for concurrent sessions
- * that share one `.planning/` (e.g. a coordinator, a hardware operator and a
- * design reviewer all working the same repo at once).
+ * that share one `.planning/` (e.g. a coordinator, an implementer and a
+ * reviewer all working the same repo at once).
  *
  * Why this exists:
  *   `STATE.md`'s `## Session` block (`Stopped at` / `Last session` /
