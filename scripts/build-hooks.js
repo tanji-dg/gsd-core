@@ -46,11 +46,12 @@ const HOOKS_TO_COPY = [
   // so require('./managed-hooks-registry.cjs') resolves in the installed hooks/ dir.
   'managed-hooks-registry.cjs',
   'gsd-context-monitor.js',
-  // SessionStart(clear) resume hook: machinises the handoff claim +
+  // SessionStart(clear) resume hook: automates the handoff claim +
   // `state session-resume` for the unattended pause → /clear → resume cycle.
   'gsd-resume-hook.js',
   // Stop hook: requests /gsd-pause-work at a context threshold and hands the
-  // committed handoff to hooks.clear_command (requires gsd-resume-hook.js).
+  // settled handoff to autopause.clear_command. Both require
+  // hooks/lib/autopause-shared.js (shipped with hooks/lib/).
   'gsd-pause-hook.js',
   // Cursor lifecycle hooks (#777 + ADR-1239/#2089): 6 managed events
   'gsd-cursor-session-start.js',

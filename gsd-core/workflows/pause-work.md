@@ -78,8 +78,12 @@ If phase is detected, proceed with phase handoff path. Otherwise use the first m
 ```bash
 # --keep-session only when the user asked to stay paused (/gsd-pause-work --keep-session):
 # the committed handoff is then left for a manual /clear + /gsd-resume-work.
-pause_hook="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/hooks/gsd-pause-hook.js"
-if [ -f "$pause_hook" ]; then
+# The hook ships with the installed hook bundle: the plugin root, the config root, or a --local .claude/.
+pause_hook=""
+for cand in "${CLAUDE_PLUGIN_ROOT:-}/hooks/gsd-pause-hook.js" "${CLAUDE_CONFIG_DIR:-$HOME/.claude}/hooks/gsd-pause-hook.js" ".claude/hooks/gsd-pause-hook.js"; do
+  [ -f "$cand" ] && { pause_hook="$cand"; break; }
+done
+if [ -n "$pause_hook" ]; then
   if echo "$ARGUMENTS" | grep -q -- '--keep-session'; then node "$pause_hook" --keep-session; else node "$pause_hook" --request-now; fi
 fi
 ```

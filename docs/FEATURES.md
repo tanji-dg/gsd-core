@@ -62,6 +62,7 @@
   - [Developer Profiling](#38-developer-profiling)
   - [Execution Hardening](#39-execution-hardening)
   - [Verification Debt Tracking](#40-verification-debt-tracking)
+  - [Autopause Capability](#183-autopause-capability)
 - [v1.27 Features](#v127-features)
   - [Fast Mode](#41-fast-mode)
   - [Cross-AI Peer Review](#42-cross-ai-peer-review)
@@ -201,7 +202,6 @@
   - [Machine-Readable State Contract (`.planning/state.json`)](#166-machine-readable-state-contract-planningstatejson)
   - [Stated Failing Direction](#167-stated-failing-direction)
   - [Runtime Identity](#168-runtime-identity)
-  - [Autopause Capability](#183-autopause-capability)
   - [Context Drift Gate](#3348-context-drift-gate)
   - ["Failure Is a Value" — Strict Argv Rejection and the `--pick` Absence Contract](#3884-failure-is-a-value--strict-argv-rejection-and-the---pick-absence-contract)
   - [No Silent Swallow, No Verdict From Dropped Data](#3885-no-silent-swallow-no-verdict-from-dropped-data)
@@ -1279,9 +1279,9 @@ fix(03-01): correct auth token expiry
 - REQ-HOOK-06: All hooks MUST fail silently on any error
 - REQ-HOOK-07: Context usage MUST normalize for autocompact buffer (16.5% reserved, or the `CLAUDE_CODE_AUTO_COMPACT_WINDOW` share) — and MUST skip the buffer entirely when auto-compact is off (`autoCompactEnabled: false` in settings, or `DISABLE_AUTO_COMPACT` / `DISABLE_COMPACT`), so the bar shows the raw used%
 - REQ-HOOK-08: Update banner MUST be opt-in and silent unless an update is available (PR #2795)
-- REQ-HOOK-10: The Stop pause hook (autopause capability) MUST be inert unless `autopause.enabled`, MUST only request a pause above the configured used% (guarded by `autopause.guard_command`, once per 30 min, never on `stop_hook_active`), MUST hand only a handoff written for its own request to `autopause.clear_command` (detached), and MUST never clear a manual pause on its own
+- REQ-HOOK-10: The Stop pause hook (autopause capability) MUST be inert unless `autopause.enabled`, MUST only request a pause above the configured used% (guarded by `autopause.guard_command`, once per 30 min, never on `stop_hook_active`), and MUST hand a settled handoff of this session that is newer than the session itself to `autopause.clear_command` (detached) — hook-requested or hand-started alike, `--keep-session` being the only opt-out
 - REQ-HOOK-11: With the autopause capability enabled the context monitor MUST emit one signal — its WARNING/CRITICAL text names the automatic pause threshold (`autopause.threshold_used_pct`, default 100 − critical) and tells the agent not to pause by hand — and `/gsd-pause-work` MUST arm the automatic resume itself (`--request-now`), `--keep-session` being the only way to stay paused
-- REQ-HOOK-09: The SessionStart(clear) resume hook MUST claim nothing unless a fresh pending record addressed to its own Claude Code process exists; on success it MUST route through `state session-resume` and commit only the two `.latest` deletions (`git commit --only`); it MUST never block the session (see `docs/session-resume-hook.md`)
+- REQ-HOOK-09: The SessionStart(clear) resume hook MUST claim nothing unless a fresh pending record addressed to its own Claude Code process exists; on success it MUST route through `state session-resume` and commit only the two `.latest` deletions (`git commit --only`); it MUST never block the session (see `docs/reference/autopause-contract.md`)
 
 **Statusline Display:**
 ```text
@@ -1393,6 +1393,14 @@ When verification returns `human_needed`, items are persisted as a trackable HUM
 - REQ-DEBT-04: System MUST persist human_needed verification items as trackable UAT files
 - REQ-DEBT-05: System MUST warn (non-blocking) during phase completion and transition when verification debt exists
 - REQ-DEBT-06: `/gsd-audit-uat` MUST scan all phases, categorize items by testability, and produce a human test plan
+
+---
+
+### 183. Autopause Capability
+
+**Purpose:** A default-off capability that lets a role-holding session pause itself at a context threshold, be `/clear`ed, and resume in a fresh session without a human in the loop — `gsd-pause-hook.js` (Stop) requests `/gsd-pause-work` and spawns `autopause.clear_command`; `gsd-resume-hook.js` (SessionStart, clear) claims the handoff, runs `state session-resume` and injects it. `/gsd-autopause` operates it. **A pause always resumes automatically** while the capability is on — the moment a handoff newer than the session is committed, the next Stop clears and resumes (the arm step in `/gsd-pause-work` only records the request), and the context monitor's warnings point at the automatic pause instead of asking for a manual one; to stay paused, `/gsd-pause-work --keep-session`. **A commit is not a precondition**: a pause is complete when its two files (`HANDOFF.latest.<role_id>.json` + `.continue-here.latest.<role_id>.md`) are written and settled; the capability behaves identically with `commit_docs: false` or an ignored `.planning/` — git is never consulted there, the handoff is consumed by removal. Injection is decided by size alone: full text ≤ 32 KB, else the first 8 KB with the file left on disk to Read. GSD's WIP commit is its default behaviour, not autopause's contract.
+
+**Configuration:** `autopause.enabled`, `autopause.threshold_used_pct`, `autopause.guard_command`, `autopause.clear_command`, `autopause.pending_file`, `autopause.claim_command`, `autopause.context_command`, `autopause.notify_command`
 
 
 ---
@@ -3983,14 +3991,6 @@ See [State a failing direction](how-to/state-a-failing-direction.md) and [`gsd-t
 ---
 
 _Generated by `scripts/gen-features.cjs` — add a fragment under `docs/features/` and run `--write`._
-
----
-
-### 183. Autopause Capability
-
-**Purpose:** A default-off capability that lets a role-holding session pause itself at a context threshold, be `/clear`ed, and resume in a fresh session without a human in the loop — `gsd-pause-hook.js` (Stop) requests `/gsd-pause-work` and spawns `autopause.clear_command`; `gsd-resume-hook.js` (SessionStart, clear) claims the handoff, runs `state session-resume` and injects it. `/gsd-autopause` operates it. **A pause always resumes automatically** while the capability is on — the moment a handoff newer than the session is committed, the next Stop clears and resumes (the arm step in `/gsd-pause-work` only records the request), and the context monitor's warnings point at the automatic pause instead of asking for a manual one; to stay paused, `/gsd-pause-work --keep-session`. **A commit is not a precondition**: a pause is complete when its two files (`HANDOFF.latest.<role_id>.json` + `.continue-here.latest.<role_id>.md`) are written and settled; the capability behaves identically with `commit_docs: false` or an ignored `.planning/` — git is never consulted there, the handoff is consumed by removal. Injection is decided by size alone: full text ≤ 32 KB, else the first 8 KB with the file left on disk to Read. GSD's WIP commit is its default behaviour, not autopause's contract.
-
-**Configuration:** `autopause.enabled`, `autopause.threshold_used_pct`, `autopause.guard_command`, `autopause.clear_command`, `autopause.pending_file`, `autopause.claim_command`, `autopause.context_command`, `autopause.notify_command`
 
 ---
 

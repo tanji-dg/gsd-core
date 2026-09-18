@@ -1567,7 +1567,7 @@ Analyze existing codebase with parallel mapper agents. Use `--fast` for a quick 
 
 ### `/gsd-autopause`
 
-Operate the unattended pause → `/clear` → resume cycle of the `autopause` capability. Opt-in via `autopause.enabled: true` in `config.json` (see [Configuration Reference](CONFIGURATION.md#autopause-settings) and [session-resume-hook.md](session-resume-hook.md)); when disabled, the command prints an activation hint and stops.
+Operate the unattended pause → `/clear` → resume cycle of the `autopause` capability. Opt-in via `autopause.enabled: true` in `config.json` (see [Configuration Reference](CONFIGURATION.md#autopause-settings) and [autopause contract](reference/autopause-contract.md)); when disabled, the command prints an activation hint and stops.
 
 | Subcommand | Description |
 |------------|-------------|

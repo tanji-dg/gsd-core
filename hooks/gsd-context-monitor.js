@@ -26,6 +26,7 @@ const os = require('os');
 const path = require('path');
 const { spawn } = require('child_process');
 const { HOOK_ON_CRASH, allow, crash } = require('./lib/hook-exit.js');
+const { readAutopauseConfig, resolveThreshold } = require('./lib/autopause-shared.js');
 
 // This hook only injects an advisory context-usage warning; it never blocks
 // the tool call it rides in on. A crash here (e.g. a malformed bridge file)
@@ -203,29 +204,15 @@ function writeSentinel(target, payload) {
 
 let input = '';
 /**
- * argv for the CRITICAL breadcrumb subprocess. Pure so a test can pin the
- * shape. `sessionId` (already traversal-checked by the caller) is forwarded
- * as `--session` so the breadcrumb lands in THIS session's continuity
- * record (.planning/sessions/<sid>.json) as well as the shared STATE.md
- * `## Session` block — with several sessions on one .planning/, the shared
- * block is last-writer-wins and would otherwise attribute the exhaustion to
- * whichever session wrote last.
- */
-/**
  * The autopause capability's view of this project, for the warning text:
  * { enabled, threshold } — threshold is autopause.threshold_used_pct, else
- * 100 − the resolved CRITICAL fire-point (the pause hook derives the same
- * default; see hooks/gsd-pause-hook.js resolveThreshold). Pure: takes the
- * parsed config and the resolved thresholds.
+ * 100 − the resolved CRITICAL fire-point (hooks/lib/autopause-shared.js
+ * resolveThreshold, the pause hook's rule). Pure: takes the parsed config
+ * and the resolved thresholds.
  */
 function resolveAutopause(config, thresholds) {
-  const ap = config && config.autopause && typeof config.autopause === 'object' ? config.autopause : {};
-  const enabled = ap.enabled === true;
-  const explicit = Number(ap.threshold_used_pct);
-  const threshold = Number.isFinite(explicit) && explicit > 0 && explicit <= 100
-    ? explicit
-    : 100 - (thresholds && Number.isFinite(thresholds.critical) ? thresholds.critical : CRITICAL_THRESHOLD);
-  return { enabled, threshold };
+  const critical = thresholds && Number.isFinite(thresholds.critical) ? thresholds.critical : CRITICAL_THRESHOLD;
+  return { enabled: readAutopauseConfig('', config).enabled, threshold: resolveThreshold(config, critical) };
 }
 
 /**
@@ -259,6 +246,15 @@ function buildWarningMessage({ isCritical, isGsdActive, usedPct, remaining, auto
       + 'starting new complex work.';
 }
 
+/**
+ * argv for the CRITICAL breadcrumb subprocess. Pure so a test can pin the
+ * shape. `sessionId` (already traversal-checked by the caller) is forwarded
+ * as `--session` so the breadcrumb lands in THIS session's continuity
+ * record (.planning/sessions/<sid>.json) as well as the shared STATE.md
+ * `## Session` block — with several sessions on one .planning/, the shared
+ * block is last-writer-wins and would otherwise attribute the exhaustion to
+ * whichever session wrote last.
+ */
 function buildRecordSessionArgv(gsdTools, stoppedAt, sessionId) {
   const argv = [gsdTools, 'state', 'record-session', '--stopped-at', stoppedAt];
   if (typeof sessionId === 'string' && sessionId.trim() && !/[/\\]|\.\./.test(sessionId)) {
