@@ -5,12 +5,13 @@
 
 /**
  * hooks/gsd-pause-hook.js — the Stop half of the unattended pause → /clear →
- * resume cycle (docs/session-resume-hook.md#pause-side).
+ * resume cycle (docs/reference/autopause-contract.md#pause-side).
  *
  * Contract: request a pause only above the threshold, once per TTL, never on
- * stop_hook_active, only when the guard allows; hand ONLY a handoff written
- * for that request to hooks.clear_command (detached); never clear a manual
- * pause on its own; --request-now puts a manual pause on the automatic path.
+ * stop_hook_active, only when the guard allows; hand a settled handoff of THIS
+ * session that is newer than the session itself to autopause.clear_command
+ * (detached) — hook-requested or hand-started alike; --keep-session is the
+ * only opt-out; --request-now arms a hand-started pause.
  */
 
 const { test, describe } = require('node:test');
@@ -132,7 +133,7 @@ describe('pure pieces', () => {
   test('statePathFor lives next to the pending file and sanitises the id', () => {
     const root = path.resolve(os.tmpdir(), 'proj');
     assert.equal(hook.statePathFor(root, {}, 'a/b'), path.resolve(root, '.claude', 'gsd-resume', 'state.a_b.json'));
-    assert.equal(hook.statePathFor(root, { autopause: { pending_file: '.claude/autoclear/pending.json' } }, 'S'), path.resolve(root, '.claude', 'autoclear', 'state.S.json'));
+    assert.equal(hook.statePathFor(root, { autopause: { pending_file: '.claude/autopause/pending.json' } }, 'S'), path.resolve(root, '.claude', 'autopause', 'state.S.json'));
   });
 });
 

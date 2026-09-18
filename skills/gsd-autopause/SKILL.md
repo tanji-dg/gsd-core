@@ -77,7 +77,7 @@ Read, with the Read tool (all paths relative to the project root; `<dir>` is the
 directory of `autopause.pending_file`, default `.claude/gsd-resume/`):
 
 - `.planning/config.json` → report the effective `autopause.*` values (`threshold_used_pct`
-  defaults to `100 − hooks.context_warning_threshold`, i.e. 65; empty `*_command` keys mean
+  defaults to `100 − hooks.context_critical_threshold`, i.e. 75; empty `*_command` keys mean
   "that step is manual")
 - `<dir>/state.$CLAUDE_CODE_SESSION_ID.json` → `phase` (`pause-requested` / `clear-spawned`),
   `requested_at`, `used`, `manual`

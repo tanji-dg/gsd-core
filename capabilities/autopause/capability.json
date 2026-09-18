@@ -3,7 +3,7 @@
   "role": "feature",
   "version": "1.14.0",
   "title": "Unattended pause → /clear → resume",
-  "description": "Default-off capability that lets a long-running session pause itself at a context threshold, be cleared, and resume in a fresh session without a human in the loop — for sessions that share one .planning/ under a role. Two host hooks carry it (hooks/gsd-pause-hook.js on Stop, hooks/gsd-resume-hook.js on SessionStart(clear); both no-op unless autopause.enabled). The pause hook asks the session to run /gsd-pause-work at autopause.threshold_used_pct (answering Stop with decision:block) and, once the requested handoff is committed, spawns autopause.clear_command detached. The resume hook, on a pending record addressed to its own Claude Code process, claims the role-keyed handoff, runs autopause.claim_command, `state session-resume`, commits only the two .latest deletions, and injects the handoff + a STATE.md excerpt (+ autopause.context_command output). Everything environment-specific — how /clear is typed into the session, role registries, notifications — is a *_command extension point; GSD ships none of it.",
+  "description": "Default-off capability that lets a long-running session pause itself at a context threshold, be cleared, and resume in a fresh session without a human in the loop — for sessions that share one .planning/ under a role. Two host hooks carry it (hooks/gsd-pause-hook.js on Stop, hooks/gsd-resume-hook.js on SessionStart(clear); both no-op unless autopause.enabled). The pause hook asks the session to run /gsd-pause-work at autopause.threshold_used_pct (answering Stop with decision:block) and, once the requested handoff is committed, spawns autopause.clear_command detached. The resume hook, on a pending record addressed to its own Claude Code process, claims the role-keyed handoff, runs autopause.claim_command, `state session-resume`, commits only the two .latest deletions, and injects the handoff + a STATE.md excerpt (+ autopause.context_command output). Everything environment-specific — how /clear is typed into the session, per-session registration, notifications — is a *_command extension point; GSD ships none of it.",
   "tier": "full",
   "requires": [],
   "engines": {
@@ -52,7 +52,7 @@
     "autopause.claim_command": {
       "type": "string",
       "default": "",
-      "description": "Shell command the resume hook runs right after claiming the handoff and before `state session-resume` — role registry registration, milestone.lock re-keying, anything project-specific. Env: GSD_RESUME_SESSION_ID, GSD_RESUME_OLD_SESSION_ID, GSD_RESUME_ROLE, GSD_RESUME_ROLE_ID, GSD_RESUME_HANDOFF_JSON, GSD_RESUME_HANDOFF_MD, CLAUDE_CODE_SESSION_ID (= the new id). A non-zero exit is reported in the injected context, never fatal."
+      "description": "Shell command the resume hook runs right after claiming the handoff and before `state session-resume` — whatever registration of the new session id the project needs (a per-session role file, a lock keyed by session id, …). Env: GSD_RESUME_SESSION_ID, GSD_RESUME_OLD_SESSION_ID, GSD_RESUME_ROLE, GSD_RESUME_ROLE_ID, GSD_RESUME_HANDOFF_JSON, GSD_RESUME_HANDOFF_MD, CLAUDE_CODE_SESSION_ID (= the new id). A non-zero exit is reported in the injected context, never fatal."
     },
     "autopause.context_command": {
       "type": "string",
@@ -62,7 +62,7 @@
     "autopause.notify_command": {
       "type": "string",
       "default": "",
-      "description": "Shell command /gsd-pause-work's notify step runs — only when the pause ends with something the user must act on. The one-line message is appended as the last argument and exported as GSD_PAUSE_MESSAGE. Empty: no notification."
+      "description": "Shell command /gsd-pause-work's notify step runs — only when the pause ends with something the user must act on — and the pause hook runs once when a requested pause has produced no complete handoff after 10 min. The one-line message is appended as the last argument and exported as GSD_PAUSE_MESSAGE (the hook also sets GSD_PAUSE_SESSION_ID). Empty: no notification."
     }
   },
   "hooks": [],

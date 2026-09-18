@@ -2,33 +2,39 @@
 
 The `autopause` capability (`capabilities/autopause/capability.json`, default
 off — `autopause.enabled`) is two host hooks and eight `autopause.*` config keys
-([CONFIGURATION.md](CONFIGURATION.md#autopause-settings)); `/gsd-autopause` is
-its operator skill. This page is the contract.
+([CONFIGURATION.md](../CONFIGURATION.md#autopause-settings)); `/gsd-autopause` is
+its operator skill. This page is the contract: the files the two hooks and the
+project's `*_command` extension points exchange.
 
 ## Session resume hook (`gsd-resume-hook.js`)
 
 `hooks/gsd-resume-hook.js` is a `SessionStart` hook (matcher `clear`) that
-machinises the resume half of an **unattended pause → `/clear` → resume**
+automates the resume half of an **unattended pause → `/clear` → resume**
 cycle for a session that shares one `.planning/` with other sessions and works
-under a role (see [pause-work](../gsd-core/workflows/pause-work.md) — pause is
+under a role (see [pause-work](../../gsd-core/workflows/pause-work.md) — pause is
 per session, represented by the session's own `HANDOFF*.json`).
 
-GSD ships the hook and the two verbs it rides on (`state sessions`,
-`state session-resume`, see [CLI-TOOLS.md](CLI-TOOLS.md)). GSD does **not**
-ship the watcher that decides *when* to pause and types `/clear` into the
-session — that needs a way to drive the terminal (tmux `send-keys`, …) and is
-environment-specific. The contract between the two is one JSON file.
+GSD ships both hooks and the two verbs they ride on (`state sessions`,
+`state session-resume`, see [CLI-TOOLS.md](../CLI-TOOLS.md)). The Stop hook
+([pause side](#pause-side)) decides *when* to pause. GSD does **not** ship the
+command that types `/clear` into the session — that needs a way to drive the
+terminal (tmux `send-keys`, …) and is environment-specific; it is
+`autopause.clear_command`. The contract between it and the resume hook is one
+JSON file.
 
 ## Contract
 
 ```
-watcher                                  gsd-resume-hook.js (SessionStart, source == "clear")
-───────                                  ───────────────────────────────────────────────────
-1. sends /gsd:pause-work                 
+gsd-pause-hook.js (Stop) + clear_command   gsd-resume-hook.js (SessionStart, source == "clear")
+────────────────────────────────────────   ───────────────────────────────────────────────────
+1. Stop hook has the session run
+   /gsd-pause-work (decision: block)
    → HANDOFF.latest.<role_id>.json
    → .continue-here.latest.<role_id>.md
-2. writes <pending file>                 
-3. sends /clear                    ───►  4. pending is < 30 min old ∧ addressed to THIS
+2. Stop hook spawns autopause.clear_command
+   (detached) once both files are settled
+3. clear_command writes <pending file>
+   and types /clear               ───►  4. pending is < 30 min old ∧ addressed to THIS
                                             Claude Code process ∧ old_sid ≠ new sid
                                          5. claim: *.latest.<role_id>.* → *.claimed.<role_id>.<sid>.*
                                          6. autopause.claim_command (project extension point)
@@ -42,11 +48,13 @@ watcher                                  gsd-resume-hook.js (SessionStart, sourc
                                             over that, 8 KB + the claimed MD stays on disk to Read
                                             (size only — git plays no part) + STATE.md excerpt
                                             + "start from <next_action>, do not run /gsd-resume-work"
-10. sees <resumed file>            ◄───  10. writes resumed.json next to the pending file
+10. clear_command may wait for      ◄───  10. writes resumed.json next to the pending file
+    <resumed file> (its ack)
 ```
 
-Pending file — path from `.planning/config.json` `autopause.pending_file`
-(default `.claude/gsd-resume/pending.json`, always inside the project):
+Pending file — written by `autopause.clear_command`; path from
+`.planning/config.json` `autopause.pending_file` (default
+`.claude/gsd-resume/pending.json`, always inside the project):
 
 ```json
 {
@@ -89,11 +97,11 @@ text; the hook never blocks the session and always exits 0.
 
 | Key (`.planning/config.json`) | Used by | Purpose |
 |---|---|---|
-| `autopause.pending_file` | hook | where the watcher writes the pending record |
-| `autopause.claim_command` | hook | runs after the claim, before `session-resume` — role registry registration, `milestone.lock` re-keying, anything project-specific. Env: `GSD_RESUME_SESSION_ID`, `GSD_RESUME_OLD_SESSION_ID`, `GSD_RESUME_ROLE`, `GSD_RESUME_ROLE_ID`, `GSD_RESUME_HANDOFF_JSON`, `GSD_RESUME_HANDOFF_MD`, `CLAUDE_CODE_SESSION_ID` |
-| `autopause.context_command` | hook | runs after the claim; exit 0 → stdout (≤ 4 KB, else first 4 KB + `<!-- TRUNCATED -->`) is appended as `### Project context (autopause.context_command)`. Same env as `resume_claim_command`, 10 s timeout. For the lines a role keeps outside its handoff — e.g. `grep` the role / `successor` lines out of STATE.md `## Session Continuity` — without Reading the whole file back |
-| `autopause.notify_command` | pause-work `notify` step | how to reach the user when a pause ends with something only they can act on |
-| `hooks.context_warning_threshold` | pause hook (default source) | the same "remaining ≤ N %" fire-point the context monitor uses — a watcher that pauses at the WARNING point stays consistent with the agent-facing warning |
+| `autopause.pending_file` | both hooks | where `autopause.clear_command` writes the pending record; the state files and logs of both hooks live in the same directory |
+| `autopause.claim_command` | hook | runs after the claim, before `session-resume` — whatever registration of the new session id the project needs (a per-session role file, a project lock keyed by session id, …); nothing project-specific lives in the hook. Env: `GSD_RESUME_SESSION_ID`, `GSD_RESUME_OLD_SESSION_ID`, `GSD_RESUME_ROLE`, `GSD_RESUME_ROLE_ID`, `GSD_RESUME_HANDOFF_JSON`, `GSD_RESUME_HANDOFF_MD`, `CLAUDE_CODE_SESSION_ID` |
+| `autopause.context_command` | hook | runs after the claim; exit 0 → stdout (≤ 4 KB, else first 4 KB + `<!-- TRUNCATED -->`) is appended as `### Project context (autopause.context_command)`. Same env as `autopause.claim_command`, 10 s timeout. For the lines a role keeps outside its handoff — e.g. `grep` the role / `successor` lines out of STATE.md `## Session Continuity` — without Reading the whole file back |
+| `autopause.notify_command` | pause-work `notify` step; pause hook | how to reach the user when a pause ends with something only they can act on, and the pause hook's one-time report of a requested pause that produced no handoff within 10 min (`GSD_PAUSE_MESSAGE`, `GSD_PAUSE_SESSION_ID`) |
+| `hooks.context_critical_threshold` | pause hook (default source of `autopause.threshold_used_pct`) | the context monitor's CRITICAL fire-point ("remaining ≤ N %"): the pause runs at `100 − N` used, so WARNING means "wrap up" and CRITICAL means "the pause runs" — one signal |
 
 Both commands run through the platform shell (`cmd.exe` on Windows, `/bin/sh`
 elsewhere); a small Node script that reads the environment is the portable
@@ -101,10 +109,9 @@ choice.
 
 ## Pause side
 
-`hooks/gsd-pause-hook.js` is the **Stop** hook that turns the watcher's
-"decide when to pause" step into a stateless per-turn check, so a project only
-has to provide the two shell commands GSD cannot: an optional guard and the
-`/clear` sender.
+`hooks/gsd-pause-hook.js` is the **Stop** hook that decides when to pause as a
+stateless per-turn check, so a project only has to provide the two shell
+commands GSD cannot: an optional guard and the `/clear` sender.
 
 ```
 every Stop                      gsd-pause-hook.js
@@ -158,7 +165,7 @@ right before the clear. `/gsd-pause-work --keep-session` writes `keep-session` (
 and (b) leaves that pause alone.
 Guard env: `GSD_PAUSE_SESSION_ID`, `GSD_PAUSE_CLAUDE_PID`, `GSD_PAUSE_USED_PCT`.
 Clear env: `GSD_CLEAR_SESSION_ID` (old id), `GSD_CLEAR_CLAUDE_PID`, `GSD_CLEAR_SESSION_NAME`
-(from `<CLAUDE_CONFIG_DIR>/sessions/<pid>.json`), `GSD_CLEAR_ROLE`, `GSD_CLEAR_ROLE_ID`,
+(the session's optional display name from `<CLAUDE_CONFIG_DIR>/sessions/<pid>.json`, empty when never set), `GSD_CLEAR_ROLE`, `GSD_CLEAR_ROLE_ID`,
 `GSD_CLEAR_HANDOFF_JSON`, `GSD_CLEAR_HANDOFF_MD`, `GSD_CLEAR_STATE_DIR` (project-relative
 POSIX). The clear command is expected to type `/clear` into the session and to
 write the pending record described above, so `gsd-resume-hook.js` can finish
@@ -172,7 +179,8 @@ resume hook only prints the unclaimed-handoff listing.
 The plugin manifest (`hooks/hooks.json`) registers the resume hook under
 `SessionStart` with `"matcher": "clear"` and the pause hook under `Stop`.
 For a classic (non-plugin) install add the same entries to `settings.json`
-yourself — both are inert without a pending file / a threshold crossing, so
+yourself (`$HOME/.claude` below is the config root — `CLAUDE_CONFIG_DIR`, or the
+project's `.claude/` for a `--local` install) — both are inert without a pending file / a threshold crossing, so
 registering them costs nothing:
 
 ```json

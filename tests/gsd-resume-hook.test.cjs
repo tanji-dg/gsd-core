@@ -5,7 +5,7 @@
 
 /**
  * hooks/gsd-resume-hook.js — the SessionStart(clear) half of the unattended
- * pause → /clear → resume cycle (docs/session-resume-hook.md).
+ * pause → /clear → resume cycle (docs/reference/autopause-contract.md).
  *
  * The contract under test: claim NOTHING unless every precondition holds;
  * when they do, claim by rename, run the project extension point, route
@@ -33,11 +33,11 @@ describe('pure pieces', () => {
   test('resolvePendingPath: default, configured, and never outside the project', () => {
     const root = path.resolve(os.tmpdir(), 'proj');
     assert.equal(hook.resolvePendingPath(root, {}), path.resolve(root, hook.DEFAULT_PENDING_FILE));
-    assert.equal(hook.resolvePendingPath(root, { autopause: { pending_file: '.claude/autoclear/pending.json' } }), path.resolve(root, '.claude/autoclear/pending.json'));
+    assert.equal(hook.resolvePendingPath(root, { autopause: { pending_file: '.claude/autopause/pending.json' } }), path.resolve(root, '.claude/autopause/pending.json'));
     assert.equal(hook.resolvePendingPath(root, { autopause: { pending_file: '../../evil.json' } }), path.resolve(root, hook.DEFAULT_PENDING_FILE));
     assert.equal(hook.resolvePendingPath(root, { autopause: { pending_file: '.' } }), path.resolve(root, hook.DEFAULT_PENDING_FILE));
     // the pre-capability spelling is NOT read
-    assert.equal(hook.resolvePendingPath(root, { hooks: { resume_pending_file: '.claude/autoclear/pending.json' } }), path.resolve(root, hook.DEFAULT_PENDING_FILE));
+    assert.equal(hook.resolvePendingPath(root, { hooks: { resume_pending_file: '.claude/autopause/pending.json' } }), path.resolve(root, hook.DEFAULT_PENDING_FILE));
   });
 
   test('readAutopauseConfig: defaults, enabled must be literally true, only autopause.* is read', () => {
@@ -62,7 +62,7 @@ describe('pure pieces', () => {
   });
 
   test('injectableMarkdown: by size only — full ≤ 32 KB, else 8 KB head + keep the file; multibyte-safe cut', () => {
-    const big = 'あ'.repeat(12000); // 36 KB in UTF-8
+    const big = '€'.repeat(12000); // a 3-byte code point: 36 KB in UTF-8
     const out = hook.injectableMarkdown(big, { keepPath: '.planning/x.md' });
     assert.equal(out.keepFile, true);
     assert.ok(Buffer.byteLength(out.text, 'utf8') < 8 * 1024 + 300);
@@ -98,10 +98,10 @@ describe('pure pieces', () => {
     const planning = path.join(dir, '.planning');
     fs.mkdirSync(path.join(planning, 'phases', '02-x'), { recursive: true });
     assert.equal(hook.listingLine(planning, 'why'), '');
-    fs.writeFileSync(path.join(planning, 'HANDOFF.latest.design.json'), JSON.stringify({ role: 'design reviewer', timestamp: '2026-09-16T05:00:00Z' }));
+    fs.writeFileSync(path.join(planning, 'HANDOFF.latest.design.json'), JSON.stringify({ role: 'reviewer', timestamp: '2026-09-16T05:00:00Z' }));
     fs.writeFileSync(path.join(planning, 'HANDOFF.A.json'), '{}');
     const line = hook.listingLine(planning, 'why');
-    assert.match(line, /design\(design reviewer\) 2026-09-16T05:00/);
+    assert.match(line, /design\(reviewer\) 2026-09-16T05:00/);
     assert.match(line, /\(why\)/);
     assert.doesNotMatch(line, /HANDOFF\.A/);
     assert.equal(hook.findLatestContinueHere(dir, 'design', null), null);
@@ -124,7 +124,7 @@ describe('registration', () => {
   test('trimContextOutput: empty, small, 4 KB cut', () => {
     assert.equal(hook.trimContextOutput('  \r\n '), '');
     assert.equal(hook.trimContextOutput('a\r\nb\n'), 'a\nb');
-    const out = hook.trimContextOutput('い'.repeat(3000)); // 9 KB
+    const out = hook.trimContextOutput('€'.repeat(3000)); // 3-byte code points: 9 KB
     assert.ok(Buffer.byteLength(out, 'utf8') <= hook.CONTEXT_LIMIT_BYTES + 30);
     assert.match(out, /<!-- TRUNCATED -->$/);
     assert.ok(!out.includes('�'));
@@ -494,16 +494,16 @@ describe('end to end (scratch git project)', () => {
 
   test('custom autopause.pending_file is honoured', (t) => {
     const { dir, cfg } = makeProject(t);
-    fs.writeFileSync(path.join(dir, '.planning', 'config.json'), JSON.stringify({ autopause: { enabled: true, pending_file: '.claude/autoclear/pending.json' } }));
-    fs.mkdirSync(path.join(dir, '.claude', 'autoclear'), { recursive: true });
-    fs.writeFileSync(path.join(dir, '.claude', 'autoclear', 'pending.json'), JSON.stringify({
+    fs.writeFileSync(path.join(dir, '.planning', 'config.json'), JSON.stringify({ autopause: { enabled: true, pending_file: '.claude/autopause/pending.json' } }));
+    fs.mkdirSync(path.join(dir, '.claude', 'autopause'), { recursive: true });
+    fs.writeFileSync(path.join(dir, '.claude', 'autopause', 'pending.json'), JSON.stringify({
       version: 1, at: new Date().toISOString(), claude_pid: 99999999, old_sid: 'OLD', role: 'coordinator', role_id: 'coordinator',
     }));
     fs.writeFileSync(path.join(cfg, 'sessions', '99999999.json'), JSON.stringify({ sessionId: 'NEW' }));
     const r = run(dir, cfg, { session_id: 'NEW', source: 'clear' });
     assert.equal(r.exitCode, 0, r.stderr);
     assert.match(r.context, /^# Automatic resume/);
-    assert.ok(fs.existsSync(path.join(dir, '.claude', 'autoclear', 'resumed.json')));
-    assert.ok(!fs.existsSync(path.join(dir, '.claude', 'autoclear', 'pending.json')));
+    assert.ok(fs.existsSync(path.join(dir, '.claude', 'autopause', 'resumed.json')));
+    assert.ok(!fs.existsSync(path.join(dir, '.claude', 'autopause', 'pending.json')));
   });
 });
