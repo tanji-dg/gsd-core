@@ -94,7 +94,9 @@ shopt -s nullglob 2>/dev/null; setopt NULL_GLOB 2>/dev/null
 # resuming session has already claimed (renamed) but not yet deleted — it
 # belongs to that session, not to whoever runs this next.
 session_id="${CLAUDE_CODE_SESSION_ID:-}"
-find .planning -maxdepth 1 -name 'HANDOFF*.json' -print 2>/dev/null || true
+for f in .planning/HANDOFF*.json; do
+  if [ -e "$f" ]; then echo "$f"; fi
+done 2>/dev/null || true
 # Structured view of the same files (preferred when gsd-tools is available;
 # the `find` lines above and below stay as the no-gsd-tools fallback):
 #   sessions[].is_self            — this handoff / record belongs to THIS session

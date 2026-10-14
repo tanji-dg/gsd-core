@@ -1,7 +1,7 @@
 {
   "id": "autopause",
   "role": "feature",
-  "version": "1.14.0",
+  "version": "1.16.0",
   "title": "Unattended pause → /clear → resume",
   "description": "Default-off capability that lets a long-running session pause itself at a context threshold, be cleared, and resume in a fresh session without a human in the loop — for sessions that share one .planning/ under a role. Two host hooks carry it (hooks/gsd-pause-hook.js on Stop, hooks/gsd-resume-hook.js on SessionStart(clear); both no-op unless autopause.enabled). The pause hook asks the session to run /gsd-pause-work at autopause.threshold_used_pct (answering Stop with decision:block) and, once the requested handoff is committed, spawns autopause.clear_command detached. The resume hook, on a pending record addressed to its own Claude Code process, claims the role-keyed handoff, runs autopause.claim_command, `state session-resume`, commits only the two .latest deletions, and injects the handoff + a STATE.md excerpt (+ autopause.context_command output). Everything environment-specific — how /clear is typed into the session, per-session registration, notifications — is a *_command extension point; GSD ships none of it.",
   "tier": "full",

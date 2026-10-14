@@ -56,9 +56,10 @@ describe('resume-project.md', () => {
     assert.match(body, /do \*\*not\*\* edit `## Session`/);
   });
 
-  test('keeps the #3689 find-based scan byte for byte', () => {
-    assert.ok(body.includes("find .planning -maxdepth 3 -name '.continue-here*.md' -print 2>/dev/null || true"));
-    assert.ok(body.includes("find .planning -maxdepth 1 -name 'HANDOFF*.json' -print 2>/dev/null || true"));
+  test('scans for session-keyed files with guarded globs, not the external find (#3689, #4805)', () => {
+    assert.ok(body.includes('for f in .planning/HANDOFF*.json; do'));
+    assert.ok(body.includes('for f in .planning/.continue-here*.md .planning/*/.continue-here*.md .planning/*/*/.continue-here*.md ./.continue-here*.md; do'));
+    assert.doesNotMatch(body, /^find \./m);
   });
 
   test('deletion of other sessions\' handoffs is forbidden', () => {
