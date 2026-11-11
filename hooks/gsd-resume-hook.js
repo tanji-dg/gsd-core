@@ -239,7 +239,7 @@ function isMine(pending, sid) {
 // ---------------------------------------------------------------------------
 
 function git(root, args) {
-  return spawnSync('git', ['-C', root].concat(args), { encoding: 'utf8', timeout: 30000 });
+  return spawnSync('git', ['-C', root].concat(args), { encoding: 'utf8', timeout: 30000 }); // allow-index-refresh: runs `commit --only`, which writes the index by design
 }
 
 function runContextCommand(cmd, root, env) {

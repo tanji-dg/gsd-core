@@ -18,6 +18,18 @@ const path = require('path');
 const { spawnSync } = require('child_process');
 const { classifyGitProbe } = require('./git-probe.js');
 
+// #5048: the read-only probes below (ls-files, diff) refresh the index; the
+// compiled owner scrubs that. The hook must still load when the artifact is
+// absent (#3582 seam), so fall back to the inherited env.
+let readOnlyGitEnv = (base = process.env) => base;
+try {
+  const { ensureRuntimeBuild } = require('../../gsd-core/bin/ensure-runtime-build.cjs');
+  ensureRuntimeBuild();
+  ({ readOnlyGitEnv } = require('../../gsd-core/bin/lib/read-only-git-env.cjs'));
+} catch {
+  // artifact absent: keep the inert fallback above
+}
+
 const DEFAULT_PENDING_FILE = '.claude/gsd-resume/pending.json';
 const DEFAULT_THRESHOLD_USED_PCT = 75;
 const HANDOFF_LATEST_RE = /^HANDOFF\.latest\.([a-z0-9-]+)\.json$/;
@@ -214,7 +226,7 @@ function commitDocsEnabled(root, config) {
   if (cfg.commit_docs === false) return false;
   if (cfg.planning && typeof cfg.planning === 'object' && cfg.planning.commit_docs === false) return false;
   if (!fs.existsSync(path.join(root, '.git'))) return false;
-  const r = spawnSync('git', ['-C', root, 'check-ignore', '-q', '--no-index', '--', '.planning'], { stdio: 'ignore', timeout: GIT_PROBE_TIMEOUT_MS });
+  const r = spawnSync('git', ['-C', root, 'check-ignore', '-q', '--no-index', '--', '.planning'], { stdio: 'ignore', timeout: GIT_PROBE_TIMEOUT_MS }); // allow-index-refresh: --no-index never opens the index
   return r.status !== 0;
 }
 
@@ -225,9 +237,9 @@ function commitDocsEnabled(root, config) {
  * not become one.
  */
 function trackedAndClean(root, rel) {
-  const a = spawnSync('git', ['-C', root, 'ls-files', '--error-unmatch', '--', rel], { stdio: 'ignore', timeout: GIT_PROBE_TIMEOUT_MS });
+  const a = spawnSync('git', ['-C', root, 'ls-files', '--error-unmatch', '--', rel], { stdio: 'ignore', timeout: GIT_PROBE_TIMEOUT_MS, env: readOnlyGitEnv(process.env) });
   if (!classifyGitProbe(a).determined || a.status !== 0) return false;
-  const b = spawnSync('git', ['-C', root, 'diff', '--quiet', 'HEAD', '--', rel], { stdio: 'ignore', timeout: GIT_PROBE_TIMEOUT_MS });
+  const b = spawnSync('git', ['-C', root, 'diff', '--quiet', 'HEAD', '--', rel], { stdio: 'ignore', timeout: GIT_PROBE_TIMEOUT_MS, env: readOnlyGitEnv(process.env) });
   return classifyGitProbe(b).determined && b.status === 0;
 }
 
