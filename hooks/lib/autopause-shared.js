@@ -17,6 +17,7 @@ const os = require('os');
 const path = require('path');
 const { spawnSync } = require('child_process');
 const { classifyGitProbe } = require('./git-probe.js');
+const { readConfigFileBounded } = require('./config-read.js');
 
 // #5048: the read-only probes below (ls-files, diff) refresh the index; the
 // compiled owner scrubs that. The hook must still load when the artifact is
@@ -55,8 +56,9 @@ const AUTOPAUSE_DEFAULTS = Object.freeze({
 // small helpers (fs only; every read is best-effort)
 // ---------------------------------------------------------------------------
 
+// #5759: bounded read — a FIFO or device planted at the path must not stall the hook.
 function readJson(p) {
-  try { return JSON.parse(fs.readFileSync(p, 'utf8')); } catch (e) { return null; }
+  try { return JSON.parse(readConfigFileBounded(p, { required: true })); } catch (e) { return null; }
 }
 
 /** tmp + rename in the target directory. No Windows EPERM retry: both hooks
