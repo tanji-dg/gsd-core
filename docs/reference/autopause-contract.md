@@ -171,6 +171,36 @@ POSIX). The clear command is expected to type `/clear` into the session and to
 write the pending record described above, so `gsd-resume-hook.js` can finish
 the cycle.
 
+## Project-owned pause and resume
+
+A project with its own pause/resume procedure (its own skills, its own hand-over
+file instead of `HANDOFF*.json`, sessions without a role) keeps GSD's *timing*
+(threshold, `/clear` sender, pending record) and replaces the *content*. Every
+key below is optional; with none set the behaviour above is unchanged. A hook
+cannot run a skill: it can only name it in the Stop block reason or in the
+SessionStart `additionalContext`, and the session runs it.
+
+| Key | Effect |
+|---|---|
+| `autopause.pause_skill` | The Stop block reason says "Run the `<skill>` skill NOW" instead of `gsd-pause-work`, and drops the GSD-specific wording (WIP commit, older-handoff note). `--request-now` prints the same name. |
+| `autopause.pause_instructions` | Appended to that block reason (a string, or in a hand-edited config.json an array of lines joined by newlines). |
+| `autopause.done_command` | Decides "the pause is done" instead of the `HANDOFF.latest.<role_id>.json` check. Runs on each Stop while the state is `pause-requested` (not `keep-session`, not `clear-spawned`); exit 0 → `autopause.clear_command` is spawned (once); non-zero or timeout → not yet. The first stdout line may be JSON `{ "role_id", "role", "note" }`: `role_id` (`[a-z0-9-]+`) and `role` become `GSD_CLEAR_ROLE_ID` / `GSD_CLEAR_ROLE`; both are empty otherwise, as are `GSD_CLEAR_HANDOFF_JSON` / `GSD_CLEAR_HANDOFF_MD`. Env: `GSD_PAUSE_SESSION_ID`, `GSD_PAUSE_CLAUDE_PID`, `GSD_PAUSE_REQUESTED_AT`, `GSD_PAUSE_PROJECT_DIR` (the hook's project root — do not rely on the cwd). 10 s timeout; any settle/commit check is the command's job. |
+| `autopause.resume_skill` | Project-owned resume: the injected text says "Run `/<skill>` first". No `HANDOFF` claim, no `state session-resume`, no STATE.md excerpt, no file deleted. |
+| `autopause.resume_command` | Its stdout (≤ 32 KB, 20 s) is the injected body of a project-owned resume (alone or with `resume_skill`). |
+
+A project-owned resume still needs the pending record written by `clear_command`
+(`old_sid`, `claude_pid`, no `role_id` required — the hook does not look at
+it). `claim_command` and `context_command` run as before; the resume env also
+carries `GSD_RESUME_PROJECT_DIR`. When the pending record does not validate
+(wrong `source`, no / stale pending file, unchanged session id, addressed to
+another process) **nothing is injected** — not even the unclaimed-handoff
+listing, which would point at files this project does not use — and the reason
+goes to `gsd-resume-hook.log`. The resume ack (`resumed.json`) and the pause
+hook's session floor are written as usual.
+
+`guard_command` stays the "not now" switch before a pause is requested (it also
+receives `GSD_PAUSE_PROJECT_DIR`); use it to leave individual sessions out.
+
 ## Registration
 
 Both hooks read `autopause.enabled` first: off, the pause hook exits silently and the

@@ -72,7 +72,7 @@ const path = require('path');
 const { spawn, spawnSync } = require('child_process');
 const { HOOK_ON_CRASH, allow, crash } = require('./lib/hook-exit.js');
 const {
-  DEFAULT_THRESHOLD_USED_PCT, HANDOFF_LATEST_RE,
+  DEFAULT_THRESHOLD_USED_PCT, DEFAULT_PAUSE_SKILL, HANDOFF_LATEST_RE,
   readJson, writeJsonAtomic, sid8, toPosix, claudeHome, makeLogger, sleepMs, readStdinJson, readProjectConfig,
   readAutopauseConfig, resolveThreshold, stateDir, statePathFor, findLatestContinueHere, commitDocsEnabled, trackedAndClean,
 } = require('./lib/autopause-shared.js');
@@ -82,6 +82,7 @@ const ON_CRASH = HOOK_ON_CRASH.ALLOW;
 const REQUEST_TTL_MS = 30 * 60 * 1000;
 const HANDOFF_SLACK_MS = 60 * 1000;
 const GUARD_TIMEOUT_MS = 30000;
+const DONE_TIMEOUT_MS = 10000;
 // A handoff counts as written once neither file has changed for this long;
 // a Stop that arrives earlier waits out the remainder (bounded by SETTLE_MS).
 const SETTLE_MS = (Number(process.env.GSD_AUTOPAUSE_SETTLE_MS) > 0) ? Number(process.env.GSD_AUTOPAUSE_SETTLE_MS) : 10000; // env: test seam only
@@ -150,7 +151,18 @@ function decide({ stopHookActive, state, handoff, used, threshold, nowMs, floorM
 }
 
 /** The block reason: what the session must do now (generic, unattended). */
-function blockReason(used, threshold, manualHandoffFile) {
+function blockReason(used, threshold, manualHandoffFile, custom) {
+  const skill = (custom && custom.skill) || DEFAULT_PAUSE_SKILL;
+  const instructions = (custom && custom.instructions) || '';
+  if (skill !== DEFAULT_PAUSE_SKILL || instructions) {
+    // The project owns the pause procedure: name its skill, add its instructions, keep only the generic rules.
+    return `[gsd-pause-hook] Context is at ${used}% used (threshold ${threshold}%). `
+      + `Run the \`${skill}\` skill NOW; do nothing else this turn. `
+      + 'Do not ask the user anything — write `unknown` for what you do not know. '
+      + 'Do not describe state from memory: measure it now (processes, files, devices, last output). '
+      + (instructions ? `${instructions} ` : '')
+      + 'When it is done the session is cleared automatically.';
+  }
   return `[gsd-pause-hook] Context is at ${used}% used (threshold ${threshold}%). `
     + 'Run the `gsd-pause-work` skill NOW and finish through the WIP commit; do nothing else this turn. '
     + 'Do not ask the user anything — write `unknown` for what you do not know. '
@@ -290,6 +302,40 @@ function notifyStall(root, autopause, sid, state, sp, log) {
 // the three outcomes of a Stop
 // ---------------------------------------------------------------------------
 
+/**
+ * autopause.done_command: has the project's own pause procedure finished?
+ * Exit 0 = done (the first stdout line may be JSON { role_id, role, note });
+ * anything else = not yet. Returns null when not done, else a handoff-shaped
+ * record for spawnClear (no files: the project owns its handoff format).
+ */
+function runDoneCommand(ctx, session) {
+  const { root, sid, autopause, state, log } = ctx;
+  const r = spawnSync(autopause.done_command, {
+    cwd: root, shell: true, encoding: 'utf8', timeout: DONE_TIMEOUT_MS,
+    env: Object.assign({}, process.env, {
+      GSD_PAUSE_SESSION_ID: sid,
+      GSD_PAUSE_CLAUDE_PID: session ? String(session.pid) : '',
+      GSD_PAUSE_REQUESTED_AT: state.requested_at || '',
+      GSD_PAUSE_PROJECT_DIR: root,
+    }),
+  });
+  const first = ((r.stdout || '') + (r.stderr || '')).trim().split('\n')[0] || '';
+  if (r.error || r.status !== 0) {
+    const why = r.error ? (r.error.code === 'ETIMEDOUT' ? 'timeout' : r.error.message) : `rc=${r.status}`;
+    log(`${sid8(sid)} done_command: not done (${why}${first ? `: ${first.slice(0, 200)}` : ''})`);
+    return null;
+  }
+  let info = {};
+  try {
+    const j = JSON.parse(((r.stdout || '').trim().split('\n')[0]) || '');
+    if (j && typeof j === 'object') info = j;
+  } catch (e) { info = {}; }
+  const roleId = typeof info.role_id === 'string' && /^[a-z0-9-]+$/.test(info.role_id) ? info.role_id : '';
+  const role = typeof info.role === 'string' ? info.role : '';
+  log(`${sid8(sid)} done_command: done${roleId ? ` role_id=${roleId}` : ''}${typeof info.note === 'string' ? ` — ${info.note.slice(0, 200)}` : ''}`);
+  return { file: '(done_command)', rel: '', role_id: roleId, json: { role }, mdPath: null, complete: true };
+}
+
 /** (b): hand the written handoff to autopause.clear_command, detached. Terminates. */
 function spawnClear(ctx, handoff, session, floorMs) {
   const { root, sid, config, autopause, state, sp, dir, log } = ctx;
@@ -313,7 +359,7 @@ function spawnClear(ctx, handoff, session, floorMs) {
   const child = spawn(clearCmd, { cwd: root, shell: true, detached: true, stdio: 'ignore', windowsHide: true, env });
   child.unref();
   writeJsonAtomic(sp, Object.assign({}, state, { phase: 'clear-spawned', spawned_at: new Date().toISOString(), child_pid: child.pid || null }));
-  log(`${sid8(sid)} pause done (${handoff.file}, ${floorMs === null ? 'requested-pause rule' : `newer than session floor ${new Date(floorMs).toISOString()}`}${state.requested_at ? `, requested ${state.requested_at}` : ', not requested'}, committed: ${gitState(root, handoff.rel, config)}) → spawned autopause.clear_command pid=${child.pid}${session ? '' : ' (no sessions/<pid>.json — GSD_CLEAR_CLAUDE_PID empty)'}`);
+  log(`${sid8(sid)} pause done (${handoff.file}, ${floorMs === null ? 'requested-pause rule' : `newer than session floor ${new Date(floorMs).toISOString()}`}${state.requested_at ? `, requested ${state.requested_at}` : ', not requested'}, committed: ${handoff.rel ? gitState(root, handoff.rel, config) : 'n/a (done_command)'}) → spawned autopause.clear_command pid=${child.pid}${session ? '' : ' (no sessions/<pid>.json — GSD_CLEAR_CLAUDE_PID empty)'}`);
   allow(undefined);
 }
 
@@ -329,6 +375,7 @@ function requestPause(ctx, verdict, handoff) {
         GSD_PAUSE_SESSION_ID: sid,
         GSD_PAUSE_CLAUDE_PID: session ? String(session.pid) : '',
         GSD_PAUSE_USED_PCT: String(verdict.used),
+        GSD_PAUSE_PROJECT_DIR: root,
       }),
     });
     if (r.status !== 0) {
@@ -339,7 +386,7 @@ function requestPause(ctx, verdict, handoff) {
   }
   writeJsonAtomic(sp, { phase: 'pause-requested', requested_at: new Date().toISOString(), used: verdict.used, threshold: verdict.threshold });
   log(`${sid8(sid)} used=${verdict.used}% ≥ ${verdict.threshold}% → requesting pause`);
-  allow({ decision: 'block', reason: blockReason(verdict.used, verdict.threshold, handoff ? handoff.file : null) });
+  allow({ decision: 'block', reason: blockReason(verdict.used, verdict.threshold, handoff ? handoff.file : null, { skill: autopause.pause_skill, instructions: autopause.pause_instructions }) });
 }
 
 /** (c): `--request-now` / `--keep-session` from the session's own Bash tool. */
@@ -372,7 +419,7 @@ function requestNow(root, keepSession) {
   }
   writeJsonAtomic(sp, { phase: 'pause-requested', requested_at: new Date().toISOString(), manual: true, used, threshold: null });
   log(`${sid8(sid)} pause-requested manually (used=${used}%)`);
-  process.stdout.write(`pause-requested written for ${sid8(sid)}. Now run the gsd-pause-work skill; the Stop after its commit spawns autopause.clear_command.\n`);
+  process.stdout.write(`pause-requested written for ${sid8(sid)}. Now run the ${readAutopauseConfig(root, config).pause_skill || DEFAULT_PAUSE_SKILL} skill; the Stop after its commit spawns autopause.clear_command.\n`);
 }
 
 // ---------------------------------------------------------------------------
@@ -399,11 +446,18 @@ function main() {
   const state = readJson(sp) || {};
   const ctx = { root, sid, config, autopause, state, sp, dir, log };
 
-  const handoff = handoffFor(root, sid, log);
+  const doneCmd = autopause.done_command;
+  // With done_command the project, not a HANDOFF.latest.<role>.json, says when the pause is done.
+  const handoff = doneCmd ? null : handoffFor(root, sid, log);
   const used = readUsedPct(sid);
   const threshold = resolveThreshold(config);
   const session = handoff ? findSession(sid) : null;
   const floorMs = handoff ? sessionFloorMs(session, state) : null;
+  if (doneCmd && state.phase === 'pause-requested' && isRequested(state, Date.now())) {
+    const doneSession = findSession(sid);
+    const done = runDoneCommand(ctx, doneSession);
+    if (done) spawnClear(ctx, done, doneSession, null);
+  }
   const verdict = decide({ stopHookActive: input.stop_hook_active === true, state, handoff, used, threshold, nowMs: Date.now(), floorMs });
 
   if (verdict.kind === 'spawn-clear') spawnClear(ctx, handoff, session, floorMs);

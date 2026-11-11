@@ -88,6 +88,7 @@ const MD_FULL_LIMIT_BYTES = 32 * 1024;
 const POSITION_LINES = 40;
 const CLAIM_COMMAND_TIMEOUT_MS = 30000;
 const CONTEXT_COMMAND_TIMEOUT_MS = 10000;
+const RESUME_COMMAND_TIMEOUT_MS = 20000;
 const CONTEXT_LIMIT_BYTES = 4 * 1024;
 const SESSION_RESUME_TIMEOUT_MS = 30000;
 const COMMIT_RETRIES = 3;
@@ -434,6 +435,83 @@ function emit(text) {
   allow({ hookSpecificOutput: { hookEventName: 'SessionStart', additionalContext: text } });
 }
 
+/**
+ * autopause.resume_command: its stdout (≤ MD_FULL_LIMIT_BYTES) replaces the
+ * injected body. Returns { ok, why, text }.
+ */
+function runResumeCommand(cmd, root, env) {
+  const r = spawnSync(cmd, { cwd: root, shell: true, encoding: 'utf8', timeout: RESUME_COMMAND_TIMEOUT_MS, env, maxBuffer: 4 * 1024 * 1024 });
+  if (r.error || r.status !== 0) {
+    return { ok: false, why: r.error ? (r.error.code === 'ETIMEDOUT' ? 'timeout' : r.error.message) : `rc=${r.status}`, text: '' };
+  }
+  const body = String(r.stdout || '').replace(/\r\n/g, '\n').trim();
+  if (Buffer.byteLength(body, 'utf8') <= MD_FULL_LIMIT_BYTES) return { ok: true, why: '', text: body };
+  const cut = Buffer.from(body, 'utf8').subarray(0, MD_FULL_LIMIT_BYTES).toString('utf8').replace(/�+$/, '');
+  return { ok: true, why: '', text: `${cut}\n<!-- TRUNCATED -->` };
+}
+
+/**
+ * Project-owned resume (autopause.resume_skill / autopause.resume_command): no
+ * HANDOFF claim, no `state session-resume`, no STATE.md excerpt. The hook only
+ * runs the project's claim_command / context_command / resume_command and
+ * tells the session which skill to run first. Terminates.
+ */
+function customResume(ctx) {
+  const { root, sid, config, autopause, pending, result, notes, log } = ctx;
+  const env = Object.assign({}, process.env, {
+    CLAUDE_CODE_SESSION_ID: sid,
+    GSD_RESUME_SESSION_ID: sid,
+    GSD_RESUME_OLD_SESSION_ID: pending.old_sid || '',
+    GSD_RESUME_ROLE: pending.role || '',
+    GSD_RESUME_ROLE_ID: pending.role_id || '',
+    GSD_RESUME_HANDOFF_JSON: '',
+    GSD_RESUME_HANDOFF_MD: '',
+    GSD_RESUME_PROJECT_DIR: root,
+  });
+  runClaimStep(ctx, env);
+  let body = '';
+  if (autopause.resume_command) {
+    if (DRY) {
+      notes.push(`resume_command: ${autopause.resume_command}`);
+    } else {
+      const r = runResumeCommand(autopause.resume_command, root, env);
+      log(`resume_command ${r.ok ? 'ok' : 'FAIL'}: ${r.ok ? `${Buffer.byteLength(r.text, 'utf8')} bytes` : r.why}`);
+      if (r.ok) notes.push(`resume_command: ${Buffer.byteLength(r.text, 'utf8')} bytes injected`);
+      else notes.push(`★ resume_command failed (${r.why}) — nothing injected from it`);
+      body = r.text;
+    }
+  }
+  const projectContext = projectContextStep(ctx, env);
+  const who = pending.role || pending.role_id;
+  const head = [
+    `# Automatic resume (gsd-resume-hook)${who ? ` — role: ${who}` : ''}  previous session ${sid8(pending.old_sid)} → ${sid8(sid)}`,
+    '',
+    autopause.resume_skill
+      ? `- **Run \`/${autopause.resume_skill}\` first** to resume the previous session's work. This project owns its resume: nothing was claimed from \`.planning/HANDOFF*\`, and \`/gsd-resume-work\` is not needed.`
+      : '- This project owns its resume: nothing was claimed from `.planning/HANDOFF*`, and `/gsd-resume-work` is not needed.',
+    notes.length ? `- record: ${notes.join(' / ')}` : '',
+    '',
+  ].filter((l, i, a) => !(l === '' && a[i - 1] === '')).join('\n');
+  const text = `${head}${body ? `\n---\n${body}\n` : ''}${projectContext ? `\n---\n### Project context (autopause.context_command)\n\n${projectContext}\n` : ''}`;
+
+  result.ok = true;
+  result.injected_bytes = Buffer.byteLength(text, 'utf8');
+  if (DRY) {
+    process.stdout.write(`[dry-run] ${notes.join('\n[dry-run] ')}\n[dry-run] injected ${result.injected_bytes} bytes\n`);
+    allow(undefined);
+  }
+  result.note = 'project-owned resume';
+  try {
+    writeJsonAtomic(ctx.resumedPath, result);
+    fs.unlinkSync(ctx.pendingPath);
+  } catch (e) { /* gone or unwritable — the pending file ages out */ }
+  try {
+    writeJsonAtomic(statePathFor(root, config, sid), { phase: 'resumed', resumed_at: result.at, old_sid: pending.old_sid, role_id: pending.role_id || null });
+  } catch (e) { /* best-effort */ }
+  log(`done (project-owned resume): skill=${autopause.resume_skill || '-'} bytes=${result.injected_bytes}`);
+  emit(text);
+}
+
 /** The no-auto-claim exit: log the reason, list the unclaimed handoffs, allow. */
 function skipWith(planningDir, log, reason, logDetail) {
   log(`skip: ${reason}${logDetail || ''}`);
@@ -462,10 +540,19 @@ function main() {
   }
 
   const pending = readJson(pendingPath);
+  // A project that owns its resume (resume_skill / resume_command) has no
+  // HANDOFF.latest.* for the fallback listing to point at: when the pending
+  // record does not validate, inject nothing and say why in the log only.
+  const projectOwned = !!(autopause.resume_skill || autopause.resume_command);
+  const skipQuietly = (reason) => { log(`skip (project-owned resume, nothing injected): ${reason}`); allow(undefined); };
   const skip = decideSkipReason(input, pending, Date.now(), sid);
-  if (skip) skipWith(planningDir, log, skip, ` (sid ${sid8(sid)})`);
+  if (skip) { if (projectOwned) skipQuietly(`${skip} (sid ${sid8(sid)})`); skipWith(planningDir, log, skip, ` (sid ${sid8(sid)})`); }
   const mine = isMine(pending, sid);
-  if (!mine) skipWith(planningDir, log, `pending is for pid ${pending.claude_pid}, not this session`);
+  if (!mine) {
+    const why = `pending is for pid ${pending.claude_pid}, not this session`;
+    if (projectOwned) skipQuietly(why);
+    skipWith(planningDir, log, why);
+  }
   log(`pending matched (${mine}) role_id=${pending.role_id} old=${sid8(pending.old_sid)} new=${sid8(sid)}${DRY ? ' dry-run' : ''}`);
 
   const result = {
@@ -482,7 +569,10 @@ function main() {
   const ctx = {
     root, planningDir, sid, config, autopause, pending, result, notes: [], log, stop,
     rel: (p) => toPosix(path.relative(root, p)),
+    pendingPath, resumedPath,
   };
+
+  if (projectOwned) customResume(ctx);
 
   if (pending.only_clear || !pending.role_id) {
     result.ok = true;

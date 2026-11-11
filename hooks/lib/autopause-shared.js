@@ -50,7 +50,21 @@ const AUTOPAUSE_DEFAULTS = Object.freeze({
   claim_command: '',
   context_command: '',
   notify_command: '',
+  // Project-customisation keys: all empty = the built-in GSD behaviour, unchanged.
+  pause_skill: '',
+  pause_instructions: '',
+  done_command: '',
+  resume_skill: '',
+  resume_command: '',
 });
+
+const DEFAULT_PAUSE_SKILL = 'gsd-pause-work';
+
+/** A skill name safe to put in an instruction ("/name" allowed, "plugin:name" allowed); '' when not one. */
+function cleanSkillName(v) {
+  const n = String(v || '').trim().replace(/^\//, '');
+  return /^[A-Za-z0-9][A-Za-z0-9:_.-]*$/.test(n) ? n : '';
+}
 
 // ---------------------------------------------------------------------------
 // small helpers (fs only; every read is best-effort)
@@ -133,6 +147,8 @@ function readAutopauseConfig(root, config) {
   for (const key of Object.keys(AUTOPAUSE_DEFAULTS)) {
     if (raw[key] === undefined || raw[key] === null) continue;
     if (key === 'enabled') out.enabled = raw[key] === true;
+    else if (key === 'pause_instructions' && Array.isArray(raw[key])) out[key] = raw[key].filter((l) => typeof l === 'string').join('\n').trim();
+    else if (key === 'pause_skill' || key === 'resume_skill') out[key] = cleanSkillName(raw[key]);
     else if (typeof raw[key] === 'string') out[key] = raw[key].trim();
   }
   out.threshold_used_pct = Number.isFinite(Number(raw.threshold_used_pct)) ? Number(raw.threshold_used_pct) : undefined;
@@ -254,7 +270,7 @@ function findGsdTools() {
 }
 
 module.exports = {
-  DEFAULT_PENDING_FILE, DEFAULT_THRESHOLD_USED_PCT, HANDOFF_LATEST_RE, AUTOPAUSE_DEFAULTS,
+  DEFAULT_PENDING_FILE, DEFAULT_THRESHOLD_USED_PCT, DEFAULT_PAUSE_SKILL, HANDOFF_LATEST_RE, AUTOPAUSE_DEFAULTS, cleanSkillName,
   readJson, writeJsonAtomic, sid8, toPosix, claudeHome, makeLogger, sleepMs, readStdinJson, readProjectConfig,
   readAutopauseConfig, resolveThreshold, resolvePendingPath, stateDir, statePathFor,
   findLatestContinueHere, commitDocsEnabled, trackedAndClean, findGsdTools,

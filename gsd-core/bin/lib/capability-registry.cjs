@@ -471,7 +471,7 @@ const capabilities = {
   "autopause": {
     "id": "autopause",
     "role": "feature",
-    "version": "1.16.0",
+    "version": "1.20.1",
     "title": "Unattended pause → /clear → resume",
     "description": "Default-off capability that lets a long-running session pause itself at a context threshold, be cleared, and resume in a fresh session without a human in the loop — for sessions that share one .planning/ under a role. Two host hooks carry it (hooks/gsd-pause-hook.js on Stop, hooks/gsd-resume-hook.js on SessionStart(clear); both no-op unless autopause.enabled). The pause hook asks the session to run /gsd-pause-work at autopause.threshold_used_pct (answering Stop with decision:block) and, once the requested handoff is committed, spawns autopause.clear_command detached. The resume hook, on a pending record addressed to its own Claude Code process, claims the role-keyed handoff, runs autopause.claim_command, `state session-resume`, commits only the two .latest deletions, and injects the handoff + a STATE.md excerpt (+ autopause.context_command output). Everything environment-specific — how /clear is typed into the session, per-session registration, notifications — is a *_command extension point; GSD ships none of it.",
     "tier": "full",
@@ -528,6 +528,31 @@ const capabilities = {
         "type": "string",
         "default": "",
         "description": "Shell command the resume hook runs after the claim; on exit 0 its stdout (≤ 4 KB, else truncated) is appended to the injected context under \"### Project context\" — for per-role lines a project keeps outside the handoff (a coordinator's notes to a successor in STATE.md ## Session Continuity, …). Same GSD_RESUME_* env as claim_command; 10 s timeout."
+      },
+      "autopause.pause_skill": {
+        "type": "string",
+        "default": "",
+        "description": "Name of the skill the pause hook tells the session to run instead of gsd-pause-work (e.g. a project's own pause procedure). Empty = gsd-pause-work and its built-in instructions. A hook cannot run a skill: it only names it in the Stop block reason. The skill should call `node <hooks>/gsd-pause-hook.js --request-now` at its start if it must be treated as an armed pause."
+      },
+      "autopause.pause_instructions": {
+        "type": "string",
+        "default": "",
+        "description": "Project-specific instructions appended to the pause block reason (only used together with a project pause procedure; setting it alone also switches the reason to the generic wording). A JSON array of strings, hand-edited in config.json, is joined with newlines."
+      },
+      "autopause.done_command": {
+        "type": "string",
+        "default": "",
+        "description": "Shell command run on each Stop while a pause is requested: exit 0 = the project's own pause is done, so autopause.clear_command is spawned; non-zero = not yet. The first stdout line may be JSON { role_id, role, note }. Env: GSD_PAUSE_SESSION_ID, GSD_PAUSE_CLAUDE_PID, GSD_PAUSE_REQUESTED_AT, GSD_PAUSE_PROJECT_DIR; 10 s timeout. Set, it replaces the HANDOFF.latest.<role_id>.json check (so roleless and non-HANDOFF projects work). Empty = the built-in handoff check."
+      },
+      "autopause.resume_skill": {
+        "type": "string",
+        "default": "",
+        "description": "Name of the skill the resume hook tells the new session to run first. Set (or with resume_command), the project owns its resume: no HANDOFF claim, no `state session-resume`, no STATE.md excerpt — only claim_command / context_command / resume_command run. The pending record still gates it; when it does not validate nothing is injected and the reason goes to the log."
+      },
+      "autopause.resume_command": {
+        "type": "string",
+        "default": "",
+        "description": "Shell command whose stdout (≤ 32 KB) is injected as the resume body of a project-owned resume. Env as claim_command plus GSD_RESUME_PROJECT_DIR; 20 s timeout. May be combined with resume_skill."
       },
       "autopause.notify_command": {
         "type": "string",
@@ -5088,6 +5113,11 @@ const configKeys = {
   "autopause.pending_file": "autopause",
   "autopause.claim_command": "autopause",
   "autopause.context_command": "autopause",
+  "autopause.pause_skill": "autopause",
+  "autopause.pause_instructions": "autopause",
+  "autopause.done_command": "autopause",
+  "autopause.resume_skill": "autopause",
+  "autopause.resume_command": "autopause",
   "autopause.notify_command": "autopause",
   "workflow.windows_enforce": "broken-windows",
   "review.models.claude": "claude",
@@ -5264,6 +5294,36 @@ const configSchema = {
     "type": "string",
     "default": "",
     "description": "Shell command the resume hook runs after the claim; on exit 0 its stdout (≤ 4 KB, else truncated) is appended to the injected context under \"### Project context\" — for per-role lines a project keeps outside the handoff (a coordinator's notes to a successor in STATE.md ## Session Continuity, …). Same GSD_RESUME_* env as claim_command; 10 s timeout."
+  },
+  "autopause.pause_skill": {
+    "owner": "autopause",
+    "type": "string",
+    "default": "",
+    "description": "Name of the skill the pause hook tells the session to run instead of gsd-pause-work (e.g. a project's own pause procedure). Empty = gsd-pause-work and its built-in instructions. A hook cannot run a skill: it only names it in the Stop block reason. The skill should call `node <hooks>/gsd-pause-hook.js --request-now` at its start if it must be treated as an armed pause."
+  },
+  "autopause.pause_instructions": {
+    "owner": "autopause",
+    "type": "string",
+    "default": "",
+    "description": "Project-specific instructions appended to the pause block reason (only used together with a project pause procedure; setting it alone also switches the reason to the generic wording). A JSON array of strings, hand-edited in config.json, is joined with newlines."
+  },
+  "autopause.done_command": {
+    "owner": "autopause",
+    "type": "string",
+    "default": "",
+    "description": "Shell command run on each Stop while a pause is requested: exit 0 = the project's own pause is done, so autopause.clear_command is spawned; non-zero = not yet. The first stdout line may be JSON { role_id, role, note }. Env: GSD_PAUSE_SESSION_ID, GSD_PAUSE_CLAUDE_PID, GSD_PAUSE_REQUESTED_AT, GSD_PAUSE_PROJECT_DIR; 10 s timeout. Set, it replaces the HANDOFF.latest.<role_id>.json check (so roleless and non-HANDOFF projects work). Empty = the built-in handoff check."
+  },
+  "autopause.resume_skill": {
+    "owner": "autopause",
+    "type": "string",
+    "default": "",
+    "description": "Name of the skill the resume hook tells the new session to run first. Set (or with resume_command), the project owns its resume: no HANDOFF claim, no `state session-resume`, no STATE.md excerpt — only claim_command / context_command / resume_command run. The pending record still gates it; when it does not validate nothing is injected and the reason goes to the log."
+  },
+  "autopause.resume_command": {
+    "owner": "autopause",
+    "type": "string",
+    "default": "",
+    "description": "Shell command whose stdout (≤ 32 KB) is injected as the resume body of a project-owned resume. Env as claim_command plus GSD_RESUME_PROJECT_DIR; 20 s timeout. May be combined with resume_skill."
   },
   "autopause.notify_command": {
     "owner": "autopause",
