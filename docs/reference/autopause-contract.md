@@ -83,6 +83,23 @@ Resumed file — sibling `resumed.json`:
   "role": "coordinator", "claimed": null, "commit": "8bad936", "ok": true, "injected_bytes": 1263 }
 ```
 
+### What a clear command must handle
+
+GSD spawns `autopause.clear_command` detached and never looks at how it ends.
+Everything after the spawn is the command's job:
+
+- **Background agents.** After `/clear` the host can report `busy` although no
+  turn is running: background subagents started before the clear keep running.
+  Tell "a turn is running" from "only waiting for background agents" in BOTH
+  waits (before `/clear` and before the resume prompt). Do not give up on the
+  resume prompt because of the second kind — wait and send, with an upper bound.
+- **A missing ack is not a failed clear.** If the resumed record does not arrive
+  in time, check whether the session id of the pane changed. Changed → the
+  clear went through: send the resume prompt. Unchanged or unknown → stop.
+- **Never stop silently.** Every exit that leaves the session cleared but not
+  resumed, or paused but not cleared, sends one `autopause.notify_command`
+  message that names the session and the manual step.
+
 ## When it does nothing
 
 If any precondition fails — a different `source`, no or stale pending file, a

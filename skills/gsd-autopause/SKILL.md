@@ -128,3 +128,7 @@ Summarise: last request, last spawn, last resume, any line starting with `★`.
 - **`stop_hook_active`**: the Stop that follows the hook's own block never blocks again, so
   a session cannot be caught in a request loop.
 - Every step is logged; every failure lands in the injected context line starting with `★`.
+- **Cleared but not resumed.** If a session sits at an empty prompt after an
+  automatic `/clear`, type the resume prompt by hand (`/<autopause.resume_skill>`,
+  or `/gsd-resume-work` when the project has none). Nothing is lost: the pause
+  was written before the clear.
